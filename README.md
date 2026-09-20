@@ -6,7 +6,7 @@ Grysstof is [Open Brain](https://github.com/NateBJones-Projects/OB1) by [Nate B.
 
 Out of the box it *is* Open Brain: run it with no settings and it talks to Supabase exactly as Nate's version does. Set one variable and it talks to Postgres in Docker instead. Set another and it runs from a JSON file on disk with no database at all.
 
-> Nate's original README, setup guide and companion material are kept unchanged in [`docs/open-brain-README.md`](docs/open-brain-README.md) and [`docs/`](docs/). If you want the Open Brain experience as he designed it, start there. Everything in his repo still works here.
+> Open Brain was created by [Nate B. Jones](https://natesnewsletter.substack.com/). Follow his [Substack](https://natesnewsletter.substack.com/) for updates and the companion prompt pack, and join his [Discord](https://discord.gg/Cgh9WJEkeG) for help and community. His original README, setup guide and companion material are kept unchanged in [`docs/open-brain-README.md`](docs/open-brain-README.md) and [`docs/`](docs/). If you want the Open Brain experience as he designed it, start there. Everything in his repo still works here.
 
 ## Why this exists
 
