@@ -6,7 +6,7 @@ Grysstof is [Open Brain](https://github.com/NateBJones-Projects/OB1) by [Nate B.
 
 Out of the box it *is* Open Brain: run it with no settings and it talks to Supabase exactly as Nate's version does. Set one variable and it talks to Postgres in Docker instead. Set another and it runs from a JSON file on disk with no database at all.
 
-> Open Brain was created by [Nate B. Jones](https://natesnewsletter.substack.com/). Follow his [Substack](https://natesnewsletter.substack.com/) for updates and the companion prompt pack, and join his [Discord](https://discord.gg/Cgh9WJEkeG) for help and community. His original README, setup guide and companion material are kept unchanged in [`docs/open-brain-README.md`](docs/open-brain-README.md) and [`docs/`](docs/). If you want the Open Brain experience as he designed it, start there. Everything in his repo still works here.
+> Open Brain was created by [Nate B. Jones](https://natesnewsletter.substack.com/). Follow his [Substack](https://natesnewsletter.substack.com/) for updates and the companion prompt pack, and join his [Discord](https://discord.gg/Cgh9WJEkeG) for help and community. His original README, setup guide and companion material are kept unchanged in [`docs/open-brain-README.md`](docs/open-brain-README.md) and [`docs/`](docs/). If you want the Open Brain experience as he designed it, start there. On the Supabase limb (the default) everything in his repo works as before, recipes included. On any other store, what works is everything that talks to the MCP tools; his recipes that read the Supabase tables directly (most of them) have nothing to read.
 
 ## Why this exists
 
@@ -73,6 +73,8 @@ Say you want memory in Microsoft SQL, or Qdrant, or an Obsidian vault. Three ste
 3. **Run the contract against it.** Add three lines to a test file calling `runMemoryContract("mssql", () => ...)`. When those tests are green, it is a memory. Add one `case` to `compose.ts` and it is selectable by `OB_MEMORY=mssql`.
 
 Nothing else changes. The tools, the HTTP layer, the browse page and the hooks never learn the new store exists. A test (`tests/architecture.test.ts`) fails the build if anything in the body ever mentions a vendor, the network or the environment.
+
+The full guide, with every port linked, the ten combinations already proven to work together, and a checklist an agent can follow, is [`server/LIMBS.md`](server/LIMBS.md).
 
 ## What it adds to Open Brain
 
