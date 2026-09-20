@@ -16,6 +16,10 @@ __pycache__/
 .env
 .env.local
 .env.*.local
+# Per-instance settings hold real keys; only the .example files are committed.
+server/.env
+server/.env.*
+server/seed-failures*.jsonl
 credentials.json
 token.json
 gmail-sync-log.json
@@ -23,7 +27,11 @@ sync-log.json
 
 # Build artifacts
 deno.lock
+# The server pins its dependency graph; the lock is part of that promise.
+!server/deno.lock
 docs/walkthroughs/*/public/
 docs/assets/agent-memory/promotional/generated-backgrounds/**/result.json
 docs/assets/agent-memory/screenshots/**/.chrome-*/
 integrations/openclaw-agent-memory/dist/
+server/.matrix-out/
+!server/.env.example

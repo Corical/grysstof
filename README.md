@@ -1,203 +1,104 @@
-<p align="center">
-  <img src=".github/ob1-logo-wide.png" alt="Open Brain" width="600">
-</p>
+# Grysstof
 
-<h1 align="center">Open Brain</h1>
+A shared memory for your AI tools that does not care where it is stored.
 
-The infrastructure layer for your thinking. One database, one AI gateway, one chat channel. Any AI you use can plug in. No middleware, no SaaS chains, no Zapier.
+Grysstof is [Open Brain](https://github.com/NateBJones-Projects/OB1) by [Nate B. Jones](https://natesnewsletter.substack.com/), taken apart and put back together so that the storage, the AI models, the login and the logging are each a part you can swap. Same six MCP tools, same behaviour, same Supabase setup if that is what you want. Plus a few things Open Brain does not have: a fact ledger, more than one tenant, and a page to look at what is inside.
 
-This isn't a notes app. It's a database with vector search and an open protocol — built so that every AI tool you use shares the same persistent memory of you. Claude, ChatGPT, Cursor, Claude Code, whatever ships next month. One brain. All of them.
+Out of the box it *is* Open Brain: run it with no settings and it talks to Supabase exactly as Nate's version does. Set one variable and it talks to Postgres in Docker instead. Set another and it runs from a JSON file on disk with no database at all.
 
-> Open Brain was created by [Nate B. Jones](https://natesnewsletter.substack.com/). Follow the [Substack](https://natesnewsletter.substack.com/) for updates, discussion, and the companion prompt pack. Join the [Discord](https://discord.gg/Cgh9WJEkeG) for real-time help and community.
+> Nate's original README, setup guide and companion material are kept unchanged in [`docs/open-brain-README.md`](docs/open-brain-README.md) and [`docs/`](docs/). If you want the Open Brain experience as he designed it, start there. Everything in his repo still works here.
 
-## Getting Started
+## Why this exists
 
-Never built an Open Brain? Start here:
+Open Brain is good. It is also welded to Supabase: the vector search, the deduplication, the auth, the dashboard, all of it. If your company cannot use Supabase, or you want your memory on a laptop, or on Azure, or in a plain file, you were stuck.
 
-1. **[Setup Guide](docs/01-getting-started.md)** — Build the full system (database, AI gateway, Slack capture, MCP server) in about 45 minutes. No coding experience needed. Or watch the [video walkthrough](https://vimeo.com/1174979042/f883f6489a) (~27 min).
-2. **[AI-Assisted Setup](docs/04-ai-assisted-setup.md)** — Prefer building with Cursor, Claude Code, or another AI coding tool? Point it at this repo and go. Same system, different workflow.
-3. **[Companion Prompts](docs/02-companion-prompts.md)** — Five prompts that help you migrate your memories, discover use cases, and build the capture habit.
-4. **Then pick Extension 1** and start building.
+Grysstof takes the thinking part (the tools, the rules about what a memory is) and puts it in the middle with no vendor in it. Everything that touches the outside world plugs in around it. We call the middle the **body** and the plug-ins **limbs**, because that is how it feels: the body does not change when you swap an arm.
 
-**If you hit a wall:** We built a [FAQ](docs/03-faq.md) that covers the most common questions and gotchas. And if you need real-time help, we created dedicated AI assistants that know this system inside and out: a [Claude Skill](https://www.notion.so/product-templates/Open-Brain-Companion-Claude-Skill-31a5a2ccb526802797caeb37df3ba3cb?source=copy_link), a [ChatGPT Custom GPT](https://chatgpt.com/g/g-69a892b6a7708191b00e48ff655d5597-nate-jones-open-brain-assistant), and a [Gemini GEM](https://gemini.google.com/gem/1fDsAENjhdku-3RufY7ystbS1Md8MtDCg?usp=sharing). Use whichever one matches the AI tool you already use.
+## Start it
 
-## Recent Contributions
+You need [Deno](https://deno.com) 2.x. Everything runs from the `server/` folder.
 
-The 20 most recent merged PRs. This list is generated from GitHub and refreshes daily. Last updated: 2026-08-30.
+**Option A: Supabase, the Open Brain way.** Follow [Nate's setup guide](docs/01-getting-started.md). No new steps; Grysstof reads the same `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and `MCP_ACCESS_KEY`.
 
-<!-- recent-contributions:start -->
+**Option B: Postgres on your own machine.** A container with pgvector, a local embedder, and the server:
 
-| Contribution | What changed | Creator |
-| ------------ | ------------ | ------- |
-| [Refresh README recent contributions](README.md) | Refresh README recent contributions. | [@github-actions[bot]](https://github.com/github-actions[bot]) |
-| [Add deploy-pages workflow for openbrain.fyi](.github/workflows/deploy-pages.yml) | Adds deploy-pages workflow for openbrain.fyi. | [@snapsynapse](https://github.com/snapsynapse) |
-| [Google Activity import: include Gemini answers from safeHtmlItem](recipes/google-activity-import/) | Google Activity import: include Gemini answers from safeHtmlItem. | [@araece](https://github.com/araece) |
-| [Repo-learning-coach: load .env via dotenv + fix research frontmatter](recipes/repo-learning-coach/) | Repo-learning-coach: load .env via dotenv + fix research frontmatter. | [@eazene](https://github.com/eazene) |
-| [Provenance-chains: fix eval.mjs default model (dated id 404s on OpenRouter)](recipes/provenance-chains/) | Provenance-chains: fix eval.mjs default model (dated id 404s on OpenRouter). | [@eazene](https://github.com/eazene) |
-| [Fix editorial-policy auditor JSON parse under claude-haiku-4-5](recipes/editorial-policy/) | Fixes editorial-policy auditor JSON parse under claude-haiku-4-5. | [@eazene](https://github.com/eazene) |
-| [Fix add_household_item storing details as an escaped JSON string](extensions/household-knowledge/) | Fixes add_household_item storing details as an escaped JSON string. | [@hannahgwilson](https://github.com/hannahgwilson) |
-| [Thought work claims for parallel workers](schemas/thought-work-claims/) | Thought work claims for parallel workers. | [@alanshurafa](https://github.com/alanshurafa) |
-| [Authorship edges — speaker attribution + self author edges](recipes/authorship-edges/) | Authorship edges — speaker attribution + self author edges. | [@alanshurafa](https://github.com/alanshurafa) |
-| [Add capture_derived_thought MCP tool to provenance-chains](recipes/provenance-chains/) | Adds capture_derived_thought MCP tool to provenance-chains. | [@eazene](https://github.com/eazene) |
-| [Add updating-thoughts and deleting-thoughts skill packs](skills/deleting-thoughts/) | Adds updating-thoughts and deleting-thoughts skill packs. | [@eazene](https://github.com/eazene) |
-| [Report the real cause when all LLM providers fail](integrations/entity-extraction-worker/) | Report the real cause when all LLM providers fail. | [@sjgold](https://github.com/sjgold) |
-| [Content-fingerprint-dedup: add write-time fingerprint trigger](recipes/content-fingerprint-dedup/) | Content-fingerprint-dedup: add write-time fingerprint trigger. | [@eazene](https://github.com/eazene) |
-| [Fix readwise-import against content_fingerprint unique index](recipes/readwise-import/) | Fixes readwise-import against content_fingerprint unique index. | [@eazene](https://github.com/eazene) |
-| [Persistent wiki pages](schemas/wiki-pages/) | Persistent wiki pages. | [@alanshurafa](https://github.com/alanshurafa) |
-| [Fix update-thought-mcp deploy-blocking bugs](integrations/update-thought-mcp/) | Fixes update-thought-mcp deploy-blocking bugs. | [@eazene](https://github.com/eazene) |
-| [Reject non-POST MCP requests with 405 to prevent GET handshake hang](integrations/kubernetes-deployment/) | Reject non-POST MCP requests with 405 to prevent GET handshake hang. | [@jcpoyser](https://github.com/jcpoyser) |
-| [Fix ob-graph MCP GET route causing SSE reconnect storm](recipes/ob-graph/) | Fixes ob-graph MCP GET route causing SSE reconnect storm. | [@eazene](https://github.com/eazene) |
-| [Fix UUID id pagination in thought-enrichment backfills](recipes/thought-enrichment/) | Fixes UUID id pagination in thought-enrichment backfills. | [@themacmarketer](https://github.com/themacmarketer) |
-| [Fix double-encoded metadata writes in thought-enrichment](recipes/thought-enrichment/) | Fixes double-encoded metadata writes in thought-enrichment. | [@jebontheside](https://github.com/jebontheside) |
+```sh
+docker run -d --name grysstof-pg -p 55432:5432 -e POSTGRES_PASSWORD=choose-one pgvector/pgvector:pg16
+docker exec grysstof-pg psql -U postgres -c "create database grysstof"
+ollama pull nomic-embed-text            # free, local, 768-wide embeddings
 
-<!-- recent-contributions:end -->
+cd server
+cp .env.example .env                    # fill in the password, a key for the server, and a chat-model key
+deno task migrate:env                   # creates the tables
+deno task serve:env                     # http://localhost:8787/mcp
+```
 
-## Extensions — The Learning Path
+**Option C: nothing installed.** A JSON file and word-overlap search (so "runs from a JSON file" finds the thought, "nothing installed" does not; search by meaning needs an embedder, see Option B). Good enough to try the tools in a minute.
 
-Build these in order. Each one teaches new concepts through something you'll actually use. By the end, your agent manages your household, your schedule, your meals, your professional network, and your career — all interconnected.
+```sh
+cd server
+OB_MEMORY=jsonfile OB_MEMORY_DIR=./data OB_EMBEDDER=bag-of-words OB_UNDERSTANDING=rules MCP_ACCESS_KEY=try-me deno task serve
+```
 
-| # | Extension | What You Build | Difficulty |
-| --- | --------- | -------------- | ---------- |
-| 1 | [Household Knowledge Base](extensions/household-knowledge/) | Home facts your agent can recall instantly | Beginner |
-| 2 | [Home Maintenance Tracker](extensions/home-maintenance/) | Scheduling and history for home upkeep | Beginner |
-| 3 | [Family Calendar](extensions/family-calendar/) | Multi-person schedule coordination | Intermediate |
-| 4 | [Meal Planning](extensions/meal-planning/) | Recipes, meal plans, shared grocery lists | Intermediate |
-| 5 | [Professional CRM](extensions/professional-crm/) | Contact tracking wired into your thoughts | Intermediate |
-| 6 | [Job Hunt Pipeline](extensions/job-hunt/) | Application tracking and interview pipeline | Advanced |
+Then point any MCP client at `http://localhost:8000/mcp` (or 8787 for option B) with the header `x-brain-key: <your key>`. Claude Code:
 
-Extensions compound. Your CRM knows about thoughts you've captured. Your meal planner checks who's home this week. Your job hunt contacts automatically become professional network contacts. This is what happens when your agent can see across your whole system.
+```sh
+claude mcp add --transport http grysstof http://localhost:8787/mcp --header "x-brain-key: <your key>"
+```
 
-## Primitives: Concepts That Compound
+Open `http://localhost:8787/browse` in a browser to see what it holds.
 
-Some concepts show up in multiple extensions. Learn them once, apply them everywhere.
+## Plugging things in
 
-| Primitive | What It Teaches | Used By |
-| --------- | --------------- | ------- |
-| [Deploy an Edge Function](primitives/deploy-edge-function/) | Deploying any extension as a Supabase Edge Function | All extensions |
-| [Remote MCP Connection](primitives/remote-mcp/) | Connecting to Claude Desktop, ChatGPT, Claude Code, Cursor, and other clients | All extensions |
-| [Common Troubleshooting](primitives/troubleshooting/) | Solutions for connection, deployment, and database issues | All extensions |
-| [Row Level Security](primitives/rls/) | PostgreSQL policies for multi-user data isolation | Extensions 4, 5, 6 |
-| [Shared MCP Server](primitives/shared-mcp/) | Giving others scoped access to parts of your brain | Extension 4 |
+Every outside dependency is a socket on the body. Each socket has a written contract (in `server/core/ports/`) and a test suite that any plug-in must pass (in `server/tests/*.contract.ts`). You choose a plug-in per socket with one environment variable:
 
-## Community Contributions
+| Socket | What it does | Variable | Plug-ins that ship |
+|---|---|---|---|
+| Memory | stores thoughts and finds similar ones | `OB_MEMORY` | `supabase` (default), `postgres`, `sqlite`, `jsonfile`, `vector`, `keyword`, `chaos` |
+| Ledger | stores facts, keeps their history | `OB_LEDGER` | `auto` (default: same store as memory), `postgres`, `sqlite`, `jsonl`, `in-process` |
+| Embedder | turns text into vectors | `OB_EMBEDDER` | `models` (default: any OpenAI-shaped API, incl. Ollama), `bag-of-words`, `fake` |
+| Understanding | pulls topics, people and actions out of a thought | `OB_UNDERSTANDING` | `models` (default: any OpenAI-shaped chat API), `rules`, `null` |
+| Gate | decides who may in and whose memory it is | `OB_GATE` | `shared-key` (default), `keyring`, `trusted-headers`, `deny-all` |
+| Settings | where the variables come from | code only | environment, `.env` file, layered |
+| Log | where log lines go | code only | console, JSONL file |
 
-Beyond the curated learning path, the community builds and shares real tools that real people use. Every contribution below was reviewed, approved, and merged by the maintainer team. Look for the **Community Contribution** badge in each README.
+Mix them however you like. Postgres memory with a JSONL ledger. Supabase memory with local Ollama embeddings. SQLite everything on a Raspberry Pi. `deno task matrix` runs ten such combinations and checks that the tools answer the same on all of them.
 
-### [`/recipes`](recipes/) — Import Your Data
+### Writing your own
 
-Pull your digital life into Open Brain. Each recipe handles a specific data source — parsing, deduplication, embedding, and ingestion included.
+Say you want memory in Microsoft SQL, or Qdrant, or an Obsidian vault. Three steps:
 
-| Recipe | What It Does | Contributor |
-| ------ | ------------ | ----------- |
-| [ChatGPT Import](recipes/chatgpt-conversation-import/) | Parse ChatGPT data exports, filter trivial conversations, summarize via LLM | [@matthallett1](https://github.com/matthallett1) |
-| [Perplexity Import](recipes/perplexity-conversation-import/) | Import Perplexity AI search history and memory entries | [@demarant](https://github.com/demarant) |
-| [Obsidian Vault Import](recipes/obsidian-vault-import/) | Parse and import Obsidian vault notes with full metadata | [@snapsynapse](https://github.com/snapsynapse) |
-| [X/Twitter Import](recipes/x-twitter-import/) | Import tweets, DMs, and Grok chats from X data exports | [@alanshurafa](https://github.com/alanshurafa) |
-| [Instagram Import](recipes/instagram-import/) | Import DMs, comments, and captions from Instagram exports | [@alanshurafa](https://github.com/alanshurafa) |
-| [Google Activity Import](recipes/google-activity-import/) | Import Google Search, Gmail, Maps, YouTube, Chrome history from Takeout | [@alanshurafa](https://github.com/alanshurafa) |
-| [Grok (xAI) Import](recipes/grok-export-import/) | Import Grok conversation exports with MongoDB-style date handling | [@alanshurafa](https://github.com/alanshurafa) |
-| [Journals/Blogger Import](recipes/journals-blogger-import/) | Import Atom XML blog archives from Blogger/Journals | [@alanshurafa](https://github.com/alanshurafa) |
-| [Email History Import](recipes/email-history-import/) | Pull your Gmail archive into searchable thoughts | [@matthallett1](https://github.com/matthallett1) |
+1. **Read the contract.** `server/core/ports/memory.ts` says in plain words what a memory must do: remember, recall by meaning, get by id, list recent, summarise, and the rules (same text is the same thought; scores are 0 to 1; a tenant never sees another tenant's thoughts).
+2. **Write the limb.** One file in `server/adapters/memory/`. Look at `jsonfile.ts` (170 lines) for the smallest real one, or `postgres.ts` for the full one. It imports only the port, never the body.
+3. **Run the contract against it.** Add three lines to a test file calling `runMemoryContract("mssql", () => ...)`. When those tests are green, it is a memory. Add one `case` to `compose.ts` and it is selectable by `OB_MEMORY=mssql`.
 
-### [`/recipes`](recipes/) — Tools & Workflows
+Nothing else changes. The tools, the HTTP layer, the browse page and the hooks never learn the new store exists. A test (`tests/architecture.test.ts`) fails the build if anything in the body ever mentions a vendor, the network or the environment.
 
-Standalone capabilities that make your Open Brain smarter.
+## What it adds to Open Brain
 
-| Recipe | What It Does | Contributor |
-| ------ | ------------ | ----------- |
-| [Auto-Capture Protocol](recipes/auto-capture/) | Stores ACT NOW items and session summaries in Open Brain at session close using the reusable Auto-Capture skill | [@jaredirish](https://github.com/jaredirish) |
-| [Panning for Gold](recipes/panning-for-gold/) | Mine brain dumps and voice transcripts for actionable ideas — battle-tested across 13+ sessions | [@jaredirish](https://github.com/jaredirish) |
-| [Aiception (formerly Claudeception)](recipes/claudeception/) | Self-improving system that creates new skills from work sessions — skills that create other skills | [@jaredirish](https://github.com/jaredirish) |
-| [Schema-Aware Routing](recipes/schema-aware-routing/) | LLM-powered routing that distributes unstructured text across multiple database tables | [@claydunker-yalc](https://github.com/claydunker-yalc) |
-| [Fingerprint Dedup Backfill](recipes/fingerprint-dedup-backfill/) | Backfill content fingerprints and safely remove duplicate thoughts | [@alanshurafa](https://github.com/alanshurafa) |
-| [Source Filtering](recipes/source-filtering/) | Filter thoughts by source and backfill missing metadata for early imports | [@matthallett1](https://github.com/matthallett1) |
-| [Life Engine](recipes/life-engine/) | Self-improving personal assistant — calendar, habits, health, proactive briefings via Telegram or Discord | [@justfinethanku](https://github.com/justfinethanku) |
-| [Life Engine Video](recipes/life-engine-video/) | Add-on that renders Life Engine briefings as short animated videos with voiceover | [@justfinethanku](https://github.com/justfinethanku) |
-| [Daily Digest](recipes/daily-digest/) | Automated daily summary of recent thoughts delivered via email or Slack | OB1 Team |
-| [Bring Your Own Context](recipes/bring-your-own-context/) | Portable context workflow that packages extraction prompts, profile generation, and remote MCP deployment into one entrypoint | [@jonathanedwards](https://github.com/jonathanedwards) |
-| [Work Operating Model Activation](recipes/work-operating-model-activation/) | Conversation-first workflow that turns tacit work patterns into structured Open Brain records and agent-ready operating files | [@jonathanedwards](https://github.com/jonathanedwards) |
-| [World Model Diagnostic Activation](recipes/world-model-diagnostic-activation/) | Ship-now activation path for a 20-minute world-model readiness diagnostic that compounds through core Open Brain capture | [@jonathanedwards](https://github.com/jonathanedwards) |
-| [Research-to-Decision Workflow](recipes/research-to-decision-workflow/) | Composition recipe that chains canonical skills into operator and investor research, synthesis, meeting, and memo workflows | [@NateBJones](https://github.com/NateBJones) |
-| [OpenClaw Agent Memory for OB1](recipes/openclaw-agent-memory/) | Canonical recipe for using OB1 Agent Memory as the governed continuity layer for OpenClaw workflows | OB1 Team |
-| [OpenClaw Code Review Memory](recipes/openclaw-code-review-memory/) | Flagship workflow for compounding repo-specific review lessons, maintainer corrections, and false positives | OB1 Team |
-| [OpenClaw TaskFlow Work Log](recipes/openclaw-taskflow-work-log/) | Durable handoff recipe for long-running OpenClaw TaskFlows across agents, models, and channels | OB1 Team |
+**A fact is not a thought.** Thoughts are what Open Brain stores: free text, merged when it repeats, searched by meaning. A *fact* is a line in a ledger: *about* something (`client:acme`, `repo:api`, `person:sam`), a claim, where it was learned, by whom, when, and a link to the proof. Nothing in the ledger is ever edited. A newer line can *supersede* an older one; the old one stays, marked. A person can *confirm* a line. Four tools: `find_facts`, `fact_history`, `confirm_fact`, `supersede_fact`; `capture_thought` with a `subject` writes one. Facts never show up in thought searches and vice versa.
 
-### [`/skills`](skills/) — Agent Skills
+**Tenants.** Every call carries a scope, `{ tenant, actor }`, produced by the gate and never by the caller. A key maps to a tenant; two keys, two memories that cannot see each other. The `keyring` gate takes many keys; `trusted-headers` takes tenant and actor from a proxy you trust.
 
-Plain-text skill packs you can drop into Claude Code, Codex, or other AI clients that support reusable prompts/rules. These are the canonical reusable building blocks that recipes and other contributions can depend on.
+**A browser.** `GET /browse` on any instance: subjects and their fact history, a graph of facts (with supersede arrows) and of thoughts hung off the people, topics and clients they mention, search by meaning across both. It calls the same tools through the same gate, so it works on every store.
 
-| Skill | What It Does | Contributor |
-| ----- | ------------ | ----------- |
-| [Auto-Capture Skill Pack](skills/auto-capture/) | Captures ACT NOW items and session summaries to Open Brain when a session ends | [@jaredirish](https://github.com/jaredirish) |
-| [Competitive Analysis Skill Pack](skills/competitive-analysis/) | Builds competitor briefs, pricing comparisons, market maps, and strategic recommendations | [@NateBJones](https://github.com/NateBJones) |
-| [Financial Model Review Skill Pack](skills/financial-model-review/) | Reviews an existing model for assumption quality, structural risk, and scenario gaps | [@NateBJones](https://github.com/NateBJones) |
-| [Deal Memo Drafting Skill Pack](skills/deal-memo-drafting/) | Turns existing diligence materials into structured deal, IC, or partnership memos | [@NateBJones](https://github.com/NateBJones) |
-| [Research Synthesis Skill Pack](skills/research-synthesis/) | Synthesizes source sets into findings, contradictions, confidence markers, and next questions | [@NateBJones](https://github.com/NateBJones) |
-| [Meeting Synthesis Skill Pack](skills/meeting-synthesis/) | Converts meeting notes or transcripts into decisions, action items, risks, and follow-up artifacts | [@NateBJones](https://github.com/NateBJones) |
-| [Panning for Gold Skill Pack](skills/panning-for-gold/) | Turns brain dumps and transcripts into evaluated idea inventories | [@jaredirish](https://github.com/jaredirish) |
-| [Aiception Skill Pack (formerly Claudeception)](skills/claudeception/) | Extracts reusable lessons from work sessions into new skills | [@jaredirish](https://github.com/jaredirish) |
-| [Work Operating Model Skill Pack](skills/work-operating-model/) | Runs a five-layer elicitation interview and saves the approved operating model into Open Brain | [@jonathanedwards](https://github.com/jonathanedwards) |
-| [World Model Readiness Diagnostic](skills/world-model-diagnostic/) | Runs a 20-minute world-model diagnostic that maps paradigm fit, audits the boundary layer, and labels findings by confidence | [@jonathanedwards](https://github.com/jonathanedwards) |
-| [OpenClaw Agent Memory Skill Pack](skills/openclaw-agent-memory/) | Teaches OpenClaw agents to recall, write back, report usage, and respect OB1 provenance/use-policy rules | OB1 Team |
+**Claude Code hooks.** `server/entry/session-start-recall.ts` hands a new session what earlier sessions in the same folder recorded; `session-end-capture.ts` writes one fact per finished session. Register both in `~/.claude/settings.json` (the file headers show how).
 
-### [`/dashboards`](dashboards/) — Frontend Templates
+**Tests.** 270 offline, 290 with a Postgres, including a contract suite per socket, an adversarial suite that tries to cross tenants and forge provenance, and a `chaos` limb that fails on purpose to prove the body copes.
 
-Host on Vercel or Netlify, pointed at your Supabase backend. Two community-built options — pick the framework you prefer.
+## Layout
 
-| Dashboard | What It Does | Contributor |
-| --------- | ------------ | ----------- |
-| [Open Brain Dashboard](dashboards/open-brain-dashboard/) | SvelteKit dashboard with MCP proxy and Supabase auth | [@headcrest](https://github.com/headcrest) |
-| [Open Brain Dashboard (Next.js)](dashboards/open-brain-dashboard-next/) | Full-featured Next.js dashboard — 8 pages, dark theme, smart ingest, quality auditing | [@alanshurafa](https://github.com/alanshurafa) |
+```
+server/
+  core/        the body: tools, HTTP, ports (no vendor, no network, no env)
+  adapters/    the limbs, one folder per socket
+  compose.ts   the only file that names a limb; reads OB_* and wires the body
+  entry/       ways to run it: serve, migrate, seed, the Claude Code hooks
+  sql/         Postgres migrations
+  tests/       contracts, e2e, adversarial, architecture
+  tools/       matrix (every combination) and bench
+```
 
-### [`/integrations`](integrations/) — New Connections
+## Credits and licence
 
-MCP server extensions, alternative deployment targets, and capture sources beyond Slack.
-
-| Integration | What It Does | Contributor |
-| ----------- | ------------ | ----------- |
-| [Kubernetes Deployment](integrations/kubernetes-deployment/) | Fully self-hosted K8s deployment with PostgreSQL + pgvector — no Supabase required | [@velo](https://github.com/velo) |
-| [Agent Memory API](integrations/agent-memory-api/) | Runtime-neutral recall, write-back, review, inspector, and recall-trace API for OB1 Agent Memory | OB1 Team |
-| [OpenClaw Agent Memory](integrations/openclaw-agent-memory/) | OpenClaw plugin and publishing package for using OB1 Agent Memory from OpenClaw workflows | OB1 Team |
-| [Slack Capture](integrations/slack-capture/) | Quick-capture thoughts via Slack messages with auto-embedding and classification | Core |
-| [Discord Capture](integrations/discord-capture/) | Discord bot that captures messages into Open Brain, mirroring the Slack pattern | Core |
-
-### [`/schemas`](schemas/) — Database Extensions
-
-Tables and sidecars that extend the base `thoughts` model without replacing it.
-
-| Schema | What It Does | Contributor |
-| ------ | ------------ | ----------- |
-| [Agent Memory](schemas/agent-memory/) | Provenance, review, use-policy, source-reference, relation, recall-trace, and audit sidecars for agent workflow memory | OB1 Team |
-
-## Using a Contribution
-
-1. Browse the category tables above or the folders in the repo
-2. Open the contribution's folder and read the README
-3. Every README has prerequisites, step-by-step instructions, expected outcomes, and troubleshooting
-4. Most contributions involve running SQL, deploying an edge function, or hosting frontend code — the README tells you exactly what to do
-
-## Contributing
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) for the full details. The short version:
-
-- **Extensions** are curated — discuss with maintainers before submitting
-- **Primitives** should be referenced by 2+ extensions to justify extraction
-- **Recipes, schemas, dashboards, integrations, and skills** are open for community contributions
-- Every PR runs through an automated review agent that checks structure, secrets, SQL safety, dependencies, and documentation quality
-- If the agent passes, a human maintainer reviews for quality and clarity
-- Your contribution needs a README with real instructions and a `metadata.json` with structured info
-
-## Community
-
-- **[Discord](https://discord.gg/Cgh9WJEkeG)** — Real-time help, show-and-tell, contributor discussion
-- **[Substack](https://natesnewsletter.substack.com/)** — Updates, deep dives, and the story behind Open Brain
-
-## Who Maintains This
-
-Created by [Nate B. Jones](https://github.com/NateBJones).
-
-The OB1 repo team: [Jonathan Edwards](https://github.com/justfinethanku), Repo Manager; [Matt Hallett](https://github.com/matthallett1), Community Admin; [Alan Shurafa](https://github.com/alanshurafa), Community Maintainer. PRs are reviewed by the automated agent + human maintainers.
-
-## License
-
-[FSL-1.1-MIT](LICENSE.md)
+Open Brain is Nate B. Jones's work and the reason this exists; the tool behaviour, the schemas, the recipes and the docs under `docs/`, `recipes/`, `extensions/`, `integrations/` and `skills/` are his and his contributors'. Grysstof keeps his [FSL-1.1-MIT licence](LICENSE.md) and his attribution. The word is Afrikaans for grey matter.

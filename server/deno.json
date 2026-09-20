@@ -1,9 +1,23 @@
 {
   "imports": {
-    "@hono/mcp": "npm:@hono/mcp@0.1.1",
+    "@hono/mcp": "npm:@hono/mcp@0.1.5",
     "@modelcontextprotocol/sdk": "npm:@modelcontextprotocol/sdk@1.24.3",
-    "hono": "npm:hono@4.9.2",
+    "hono": "npm:hono@4.13.8",
     "zod": "npm:zod@4.1.13",
-    "@supabase/supabase-js": "npm:@supabase/supabase-js@2.47.10"
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@2.47.10",
+    "postgres": "https://deno.land/x/postgres@v0.19.3/mod.ts",
+    "@std/assert": "jsr:@std/assert@1"
+  },
+  "nodeModulesDir": "auto",
+  "tasks": {
+    "serve": "deno run --allow-net --allow-env --allow-read --allow-write entry/serve.ts",
+    "serve:env": "deno run --env-file=.env --allow-net --allow-env --allow-read --allow-write entry/serve.ts",
+    "migrate": "deno run --allow-net --allow-env --allow-read entry/migrate.ts",
+    "migrate:env": "deno run --env-file=.env --allow-net --allow-env --allow-read entry/migrate.ts",
+    "seed:env": "deno run --env-file=.env --allow-net --allow-env --allow-read --allow-write entry/seed-markdown.ts",
+    "check": "deno check index.ts compose.ts entry/*.ts seed/*.ts writer/*.ts tests/*.ts",
+    "bench": "deno run --allow-all tools/bench.ts",
+    "matrix": "deno run --allow-all tools/matrix.ts",
+    "test": "deno test --allow-net --allow-env --allow-read --allow-write --allow-run tests/"
   }
 }
