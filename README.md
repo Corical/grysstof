@@ -8,6 +8,17 @@ Out of the box it *is* Open Brain: run it with no settings and it talks to Supab
 
 > Open Brain was created by [Nate B. Jones](https://natesnewsletter.substack.com/). Follow his [Substack](https://natesnewsletter.substack.com/) for updates and the companion prompt pack, and join his [Discord](https://discord.gg/Cgh9WJEkeG) for help and community. His original README, setup guide and companion material are kept unchanged in [`docs/open-brain-README.md`](docs/open-brain-README.md) and [`docs/`](docs/). If you want the Open Brain experience as he designed it, start there. On the Supabase limb (the default) everything in his repo works as before, recipes included. On any other store, what works is everything that talks to the MCP tools; his recipes that read the Supabase tables directly (most of them) have nothing to read.
 
+## Where to look
+
+| Want to | Read |
+|---|---|
+| See how it fits together, in pictures | [`server/ARCHITECTURE.md`](server/ARCHITECTURE.md) |
+| Plug in your own store, model, login or log | [`server/LIMBS.md`](server/LIMBS.md) |
+| Run it | [Start it](#start-it), below |
+| Look at what an instance holds | `http://localhost:<port>/browse` once it runs |
+| Use it the way Nate designed it | [`docs/open-brain-README.md`](docs/open-brain-README.md) and [`docs/01-getting-started.md`](docs/01-getting-started.md) |
+| Point an agent at the repo | [`AGENTS.md`](AGENTS.md) |
+
 ## Why this exists
 
 Open Brain is good. It is also welded to Supabase: the vector search, the deduplication, the auth, the dashboard, all of it. If your company cannot use Supabase, or you want your memory on a laptop, or on Azure, or in a plain file, you were stuck.
