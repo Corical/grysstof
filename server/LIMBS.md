@@ -1,6 +1,6 @@
 # Limbs: plugging anything into Grysstof
 
-Read this if you want Grysstof to run on a store, a model, a login scheme or a log sink it does not ship with. It is written so that a developer, or an agent given this file, can add one without reading anything else first.
+The pictures are in [`ARCHITECTURE.md`](ARCHITECTURE.md). Read this if you want Grysstof to run on a store, a model, a login scheme or a log sink it does not ship with. It is written so that a developer, or an agent given this file, can add one without reading anything else first.
 
 ## The idea
 

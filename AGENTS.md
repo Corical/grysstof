@@ -2,7 +2,7 @@
 
 ## Adding a store, model, gate or log (a "limb")
 
-Read [`server/LIMBS.md`](server/LIMBS.md) first and follow its checklist. The contract for each socket is the comment block in its `server/core/ports/*.ts` file; the contract tests in `server/tests/*.contract.ts` decide whether your limb is one. Never import an adapter from `server/core/`; `server/tests/architecture.test.ts` will fail the build.
+Look at [`server/ARCHITECTURE.md`](server/ARCHITECTURE.md), then read [`server/LIMBS.md`](server/LIMBS.md) and follow its checklist. The contract for each socket is the comment block in its `server/core/ports/*.ts` file; the contract tests in `server/tests/*.contract.ts` decide whether your limb is one. Never import an adapter from `server/core/`; `server/tests/architecture.test.ts` will fail the build.
 
 ## Parallel Agent Worktrees
 

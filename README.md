@@ -74,7 +74,7 @@ Say you want memory in Microsoft SQL, or Qdrant, or an Obsidian vault. Three ste
 
 Nothing else changes. The tools, the HTTP layer, the browse page and the hooks never learn the new store exists. A test (`tests/architecture.test.ts`) fails the build if anything in the body ever mentions a vendor, the network or the environment.
 
-The full guide, with every port linked, the ten combinations already proven to work together, and a checklist an agent can follow, is [`server/LIMBS.md`](server/LIMBS.md).
+How it fits together, in five diagrams: [`server/ARCHITECTURE.md`](server/ARCHITECTURE.md). The full plug-in guide, with every port linked, the ten combinations already proven to work together, and a checklist an agent can follow: [`server/LIMBS.md`](server/LIMBS.md).
 
 ## What it adds to Open Brain
 
