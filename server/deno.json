@@ -15,6 +15,7 @@
     "migrate": "deno run --allow-net --allow-env --allow-read entry/migrate.ts",
     "migrate:env": "deno run --env-file=.env --allow-net --allow-env --allow-read entry/migrate.ts",
     "seed:env": "deno run --env-file=.env --allow-net --allow-env --allow-read --allow-write entry/seed-markdown.ts",
+    "discord": "deno run --env-file=.env.xactco --env-file=.env.discord --allow-net --allow-env --allow-read --allow-write entry/discord-capture.ts",
     "check": "deno check index.ts compose.ts entry/*.ts seed/*.ts writer/*.ts tests/*.ts",
     "bench": "deno run --allow-all tools/bench.ts",
     "matrix": "deno run --allow-all tools/matrix.ts",
