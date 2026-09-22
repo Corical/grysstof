@@ -197,6 +197,10 @@ export class PostgresMemory implements Memory {
     if (q.type) contains({ type: q.type });
     if (q.topic) contains({ topics: [q.topic] });
     if (q.person) contains({ people: [q.person] });
+    if (q.sourcePrefix !== undefined) {
+      params.push(q.sourcePrefix.replace(/[\\%_]/g, (c) => `\\${c}`) + "%");
+      where.push(`metadata->>'source' LIKE $${params.length} ESCAPE '\\'`);
+    }
     if (since !== null) { params.push(new Date(since).toISOString()); where.push(`created_at >= $${params.length}::timestamptz`); }
     params.push(boundLimit(q.limit));
     const sql = `SELECT id::text, content, metadata, created_at, updated_at FROM thoughts

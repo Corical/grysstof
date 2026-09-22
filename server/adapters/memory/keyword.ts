@@ -24,6 +24,7 @@ function matches(meta: ThoughtMetadata, q: RecentQuery): boolean {
   if (q.type !== undefined && meta.type !== q.type) return false;
   if (q.topic !== undefined && !(Array.isArray(meta.topics) && meta.topics.includes(q.topic))) return false;
   if (q.person !== undefined && !(Array.isArray(meta.people) && meta.people.includes(q.person))) return false;
+  if (q.sourcePrefix !== undefined && !(typeof meta.source === "string" && meta.source.startsWith(q.sourcePrefix))) return false;
   return true;
 }
 

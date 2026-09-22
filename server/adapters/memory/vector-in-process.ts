@@ -75,6 +75,7 @@ export class VectorMemory implements Memory {
       .filter((r) => q.type === undefined || r.metadata.type === q.type)
       .filter((r) => q.topic === undefined || (Array.isArray(r.metadata.topics) && r.metadata.topics.includes(q.topic)))
       .filter((r) => q.person === undefined || (Array.isArray(r.metadata.people) && r.metadata.people.includes(q.person)))
+      .filter((r) => q.sourcePrefix === undefined || (typeof r.metadata.source === "string" && r.metadata.source.startsWith(q.sourcePrefix)))
       .filter((r) => since === null || Date.parse(r.createdAt) >= since)
       .slice(0, boundLimit(q.limit))
       .map(strip);

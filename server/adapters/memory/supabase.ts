@@ -76,6 +76,7 @@ export class SupabaseMemory implements Memory {
     if (q.type) sel = sel.contains("metadata", { type: q.type });
     if (q.topic) sel = sel.contains("metadata", { topics: [q.topic] });
     if (q.person) sel = sel.contains("metadata", { people: [q.person] });
+    if (q.sourcePrefix !== undefined) sel = sel.like("metadata->>source", q.sourcePrefix.replace(/[\\%_]/g, (c) => `\\${c}`) + "%");
     if (since !== null) sel = sel.gte("created_at", new Date(since).toISOString());
     const { data, error } = await sel;
     if (error) throw new Error(error.message);

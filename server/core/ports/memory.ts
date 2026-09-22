@@ -66,6 +66,8 @@ export type RecentQuery = {
   topic?: string;
   person?: string;
   since?: string; // ISO 8601
+  /** Only thoughts whose metadata.source starts with this, e.g. "discord:<guild>/<channel>/" for one channel. */
+  sourcePrefix?: string;
 };
 
 export type Summary = {

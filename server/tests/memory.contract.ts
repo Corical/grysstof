@@ -126,6 +126,22 @@ export function runMemoryContract(name: string, make: MemoryFactory) {
     assertEquals((await m.recall(A, "bounded apples", { limit: 10, minScore: Infinity })).length, 0);
   });
 
+  t("recent sourcePrefix: only thoughts whose source starts with it; a prefix that is a LIKE wildcard is literal; combines with since and type", async (m) => {
+    const a = await m.remember(A, "Servest report hold stays", { type: "observation", source: "discord:g/111/1", occurred_at: "2026-09-01T08:00:00Z" });
+    const b = await m.remember(A, "Servest schedules loaded", { type: "task", source: "discord:g/111/2", occurred_at: "2026-09-10T08:00:00Z" });
+    await m.remember(A, "Swanzo ticket blocked", { type: "observation", source: "discord:g/222/3", occurred_at: "2026-09-10T08:00:00Z" });
+    await m.remember(A, "Session ended", { type: "observation", source: "claude-code:session_1" });
+    const c = await m.remember(A, "Percent sign source", { type: "observation", source: "discord:g/11%/9" });
+    const ch = await m.recent(A, { limit: 10, sourcePrefix: "discord:g/111/" });
+    assertEquals(ch.map((t) => t.id).sort(), [a.id, b.id].sort(), "one channel, both lines, not 11%/");
+    assertEquals((await m.recent(A, { limit: 10, sourcePrefix: "discord:g/111/", since: "2026-09-05" })).map((t) => t.id), [b.id]);
+    assertEquals((await m.recent(A, { limit: 10, sourcePrefix: "discord:g/111/", type: "task" })).map((t) => t.id), [b.id]);
+    assertEquals((await m.recent(A, { limit: 10, sourcePrefix: "discord:g/11%/" })).map((t) => t.id), [c.id], "% is literal, not a wildcard");
+    assertEquals((await m.recent(A, { limit: 10, sourcePrefix: "discord:g/1" })).length, 3, "a prefix is a prefix");
+    assertEquals((await m.recent(A, { limit: 10, sourcePrefix: "nothing:" })).length, 0);
+    if (m.isolation === "tenant") assertEquals((await m.recent(B, { limit: 10, sourcePrefix: "discord:" })).length, 0, "never another tenant's");
+  });
+
   t("recent bounds: negative, NaN and fractional limit; a non-ISO `since` is an error, not an empty list", async (m) => {
     await m.remember(A, "r1", {});
     await m.remember(A, "r2", {});

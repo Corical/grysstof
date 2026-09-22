@@ -173,23 +173,28 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
         topic: z.string().optional().describe("Filter by topic tag"),
         person: z.string().optional().describe("Filter by person mentioned"),
         days: z.number().int().min(1).optional().describe("Only thoughts from the last N days"),
+        since: z.string().max(40).optional().describe("Only thoughts dated at or after this ISO 8601 instant; overrides days"),
+        source_prefix: z.string().max(300).optional().describe("Only thoughts whose source starts with this, e.g. \"discord:<guild>/<channel>/\" for one channel"),
+        verbose: z.boolean().optional().default(false).describe("Also print each thought's id, exact time and source"),
       },
     },
-    async ({ limit, type, topic, person, days }) => {
+    async ({ limit, type, topic, person, days, since: sinceArg, source_prefix, verbose }) => {
       try {
         called("list_thoughts");
-        let since: string | undefined;
-        if (days !== undefined) {
+        let since: string | undefined = sinceArg;
+        if (since === undefined && days !== undefined) {
           const d = new Date();
           d.setDate(d.getDate() - days);
           since = d.toISOString();
         }
-        const found = await memory.recent(scope, { limit, type, topic, person, since });
+        const found = await memory.recent(scope, { limit, type, topic, person, since, sourcePrefix: source_prefix });
         if (!found.length) return text("No thoughts found.");
         const results = found.map((t, i) => {
           const m = t.metadata || {};
           const tags = list(m.topics).join(", ");
-          return `${i + 1}. [${day(t.createdAt)}] (${oneLine(m.type || "??")}${tags ? " - " + tags : ""})\n${quote(t.content)}`;
+          const head = `${i + 1}. [${day(t.createdAt)}] (${oneLine(m.type || "??")}${tags ? " - " + tags : ""})`;
+          const detail = verbose ? `\n   id: ${oneLine(t.id)} · at: ${t.createdAt} · source: ${oneLine(String(m.source ?? ""))}${m.proof ? ` · proof: ${oneLine(String(m.proof))}` : ""}` : "";
+          return `${head}${detail}\n${quote(t.content)}`;
         });
         return text(`${found.length} recent thought(s):\n\n${results.join("\n\n")}`);
       } catch (err) {

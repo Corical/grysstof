@@ -61,6 +61,24 @@ Deno.test("capture_thought with occurred_at dates the thought to then, not now; 
   assert(stats.result.content[0].text.includes("Total thoughts: 1"), stats.result.content[0].text);
 });
 
+Deno.test("list_thoughts: source_prefix narrows to one channel, since is an exact instant, verbose prints id, time and source", async () => {
+  const app = buildApp(ports(new KeywordMemory(), { log: new RecordingLog() }), OPTIONS);
+  await call(app, 1, "capture_thought", { content: "Servest hold stays", source: "discord:g/111/1", proof: "https://d/1", occurred_at: "2026-09-01T08:00:00Z" });
+  await call(app, 2, "capture_thought", { content: "Servest schedules loaded", source: "discord:g/111/2", proof: "https://d/2", occurred_at: "2026-09-10T08:00:00Z" });
+  await call(app, 3, "capture_thought", { content: "Swanzo ticket blocked", source: "discord:g/222/3", proof: "https://d/3", occurred_at: "2026-09-10T08:00:00Z" });
+  const chan = (await call(app, 4, "list_thoughts", { source_prefix: "discord:g/111/", limit: 50 })).result.content[0].text;
+  assertStringIncludes(chan, "2 recent thought(s)");
+  assert(!chan.includes("Swanzo"));
+  const later = (await call(app, 5, "list_thoughts", { source_prefix: "discord:g/111/", since: "2026-09-05T00:00:00Z", verbose: true, limit: 50 })).result.content[0].text;
+  assertStringIncludes(later, "1 recent thought(s)");
+  assertStringIncludes(later, "at: 2026-09-10T08:00:00.000Z");
+  assertStringIncludes(later, "source: discord:g/111/2");
+  assertStringIncludes(later, "proof: https://d/2");
+  assert(/id: \S+/.test(later));
+  const plain = (await call(app, 6, "list_thoughts", { source_prefix: "discord:g/111/", limit: 50 })).result.content[0].text;
+  assert(!plain.includes("source:"), "verbose off prints no detail line");
+});
+
 Deno.test("capture_thought with a subject and occurred_at dates the ledger line; fact_history shows Occurred and orders by it", async () => {
   const app = buildApp(ports(new KeywordMemory(), { log: new RecordingLog() }), OPTIONS);
   const later = await call(app, 1, "capture_thought", { content: "Go-live moved to 2 March", subject: "client:acme", source: "discord:a/b/1", occurred_at: "2026-02-20" });
