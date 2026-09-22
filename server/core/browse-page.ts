@@ -61,6 +61,27 @@ export const BROWSE_PAGE = String.raw`<!doctype html>
   .filters { display:grid; grid-template-columns:1fr; gap:4px; }
   .filters select { width:100%; min-width:0; }
   aside { overflow-x:hidden; }
+  #timeline { display:none; height:100%; overflow:auto; padding:12px 16px; }
+  #graph.timeline svg, #graph.timeline .ctl, #graph.timeline .legend { display:none; }
+  #graph.timeline #timeline { display:block; }
+  #timeline .head { display:flex; align-items:baseline; gap:14px; margin-bottom:8px; }
+  #timeline .head .s { font-size:18px; font-weight:600; color:var(--subject); }
+  #timeline .head .n { color:var(--dim); }
+  #timeline .prompt { color:var(--dim); padding:24px 0; font-size:15px; }
+  table.tl { border-collapse:collapse; width:100%; }
+  table.tl th { text-align:left; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); padding:4px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  table.tl td { padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  table.tl td.d, table.tl td.st, table.tl td.pf { white-space:nowrap; }
+  table.tl td.d { font-variant-numeric:tabular-nums; color:var(--dim); width:1%; }
+  table.tl td.st { width:1%; font-size:12px; }
+  table.tl td.pf { width:1%; }
+  table.tl tr.old td { color:var(--dim); }
+  table.tl tr.old td.c { text-decoration:line-through; text-decoration-color:var(--old); }
+  table.tl tr.cur td.d { border-left:3px solid var(--ok); }
+  table.tl tr.old td.d { border-left:3px solid var(--old); }
+  table.tl tr:hover td { background:#1a1d24; cursor:pointer; }
+  table.tl tr.sel td { background:#262a33; }
+  table.tl .rep { display:block; font-size:12px; color:var(--subject); margin-top:2px; }
 </style>
 </head>
 <body>
@@ -88,7 +109,8 @@ export const BROWSE_PAGE = String.raw`<!doctype html>
     <h2>Search results</h2>
     <ul id="results"></ul>
   </aside>
-  <section id="graph">
+  <section id="graph" class="timeline">
+    <div id="timeline"><div class="prompt">Pick a client on the left. Facts are shown as a timeline; the graph is for thoughts.</div></div>
     <svg></svg>
     <div class="ctl"><button id="zin">+</button><button id="zout">−</button><button id="fit">Fit</button><button id="labels" class="on">labels</button></div>
     <div class="legend" id="legend"></div>
@@ -100,7 +122,7 @@ export const BROWSE_PAGE = String.raw`<!doctype html>
 (function () {
   var KEY = "grysstof.key";
   var $ = function (id) { return document.getElementById(id); };
-  var state = { mode: "facts", subjects: [], summary: null, histories: {}, thoughts: [], selected: null, labels: true };
+  var state = { mode: "facts", subjects: [], summary: null, histories: {}, thoughts: [], selected: null, selectedSubject: null, labels: true, order: "newest" };
 
   function key() { try { return localStorage.getItem(KEY) || ""; } catch (e) { return ""; } }
   function askKey(force) {
@@ -140,7 +162,7 @@ export const BROWSE_PAGE = String.raw`<!doctype html>
       state.subjects = o.subjects; state.summary = o.summary; $("tenant").textContent = o.tenant;
       renderStats(); renderSubjects(); renderFilters();
       return Promise.all(state.subjects.slice(0, 80).map(function (s) { return history(s.subject); }));
-    }).then(function () { msg(""); draw(); }).catch(function (e) { msg(String(e.message || e)); });
+    }).then(function () { msg(""); refresh(); }).catch(function (e) { msg(String(e.message || e)); });
   }
   function history(subject) {
     if (state.histories[subject]) return Promise.resolve(state.histories[subject]);
@@ -150,7 +172,7 @@ export const BROWSE_PAGE = String.raw`<!doctype html>
     var p = "/thoughts?limit=" + $("limit").value;
     ["Type", "Topic", "Person"].forEach(function (f) { var v = $("f" + f).value; if (v) p += "&" + f.toLowerCase() + "=" + encodeURIComponent(v); });
     msg("loading thoughts…");
-    return api(p).then(function (t) { state.thoughts = t.thoughts; msg(t.thoughts.length + " thoughts"); draw(); }).catch(function (e) { msg(String(e.message || e)); });
+    return api(p).then(function (t) { state.thoughts = t.thoughts; msg(t.thoughts.length + " thoughts"); center("graph"); draw(); }).catch(function (e) { msg(String(e.message || e)); });
   }
 
   function renderStats() {
@@ -196,8 +218,38 @@ export const BROWSE_PAGE = String.raw`<!doctype html>
             (f.proof ? ' · ' + link(f.proof, "proof") : '') + '</div></li>';
         }).join("") + '</ul>';
       Array.prototype.forEach.call($("detail").querySelectorAll("li[data-id]"), function (li) { li.onclick = function () { showFact(byId[li.getAttribute("data-id")]); }; });
-      if (state.mode !== "facts") { state.mode = "facts"; setMode(); } else highlight(subject);
+      state.mode = "facts"; setMode();
     });
+  }
+  // The centre panel for facts: one client's history as a readable table, not a graph.
+  function renderTimeline(subject, facts) {
+    var byId = {}; facts.forEach(function (f) { byId[f.id] = f; });
+    var rows = facts.slice(); if (state.order === "oldest") rows.reverse();
+    var cur = facts.filter(function (f) { return !f.supersededBy; }).length;
+    $("timeline").innerHTML =
+      '<div class="head"><span class="s">' + esc(subject) + '</span><span class="n">' + cur + ' current · ' + facts.length + ' lines</span>' +
+      '<button id="order">' + (state.order === "oldest" ? "oldest first" : "newest first") + '</button></div>' +
+      '<table class="tl"><thead><tr><th>When</th><th>What became true</th><th>Status</th><th>People</th><th>Proof</th></tr></thead><tbody>' +
+      rows.map(function (f) {
+        var people = (f.tags || []).filter(function (t) { return t.indexOf("person:") === 0; }).map(function (t) { return '<span class="tag">' + esc(t.slice(7)) + '</span>'; }).join("");
+        var st = f.supersededBy ? "superseded" : f.confirmed ? '<span style="color:var(--ok)">confirmed</span>' : "current";
+        var rep = f.supersedes && byId[f.supersedes] ? '<span class="rep">replaces: ' + esc(short(byId[f.supersedes].claim, 90)) + '</span>' : "";
+        return '<tr class="' + (f.supersededBy ? "old" : "cur") + '" data-id="' + esc(f.id) + '"><td class="d">' + esc((f.occurredAt || f.learnedAt || "").slice(0, 10)) + '</td>' +
+          '<td class="c">' + esc(f.claim) + rep + '</td><td class="st">' + st + '</td><td>' + people + '</td><td class="pf">' + (f.proof ? link(f.proof, "open") : "") + '</td></tr>';
+      }).join("") + '</tbody></table>';
+    $("order").onclick = function () { state.order = state.order === "oldest" ? "newest" : "oldest"; renderTimeline(subject, facts); };
+    Array.prototype.forEach.call($("timeline").querySelectorAll("tr[data-id]"), function (tr) {
+      tr.onclick = function (e) { if (e.target.tagName === "A") return; showFact(byId[tr.getAttribute("data-id")]); };
+    });
+  }
+  function highlightRow(id) { Array.prototype.forEach.call($("timeline").querySelectorAll("tr[data-id]"), function (tr) { tr.classList.toggle("sel", tr.getAttribute("data-id") === id); }); }
+  function center(kind) { $("graph").classList.toggle("timeline", kind === "timeline"); }
+  function refresh() {
+    if (state.mode === "thoughts") { center("graph"); draw(); return; }
+    center("timeline");
+    if (state.selected && state.selected.kind === "subject") renderTimeline(state.selected.id, state.histories[state.selected.id] || []);
+    else if (state.selected && state.selected.kind === "fact" && state.histories[state.selectedSubject]) renderTimeline(state.selectedSubject, state.histories[state.selectedSubject]);
+    else $("timeline").innerHTML = '<div class="prompt">Pick a client on the left. Facts are shown as a timeline; the graph is for thoughts.</div>';
   }
   function showFact(f) {
     state.selected = { kind: "fact", id: f.id };
@@ -208,10 +260,14 @@ export const BROWSE_PAGE = String.raw`<!doctype html>
       kv("supersedes", f.supersedes ? esc(f.supersedes) : "—") + kv("superseded by", f.supersededBy ? esc(f.supersededBy) : "—") +
       kv("tags", (f.tags || []).map(function (t) { return '<span class="tag">' + esc(t) + '</span>'; }).join("") || "—") + kv("id", '<code>' + esc(f.id) + '</code>') + '</table>';
     $("toSubject").onclick = function (e) { e.preventDefault(); selectSubject(f.subject); };
+    state.selectedSubject = f.subject;
+    if (state.mode === "facts" && !state.histories[f.subject]) history(f.subject).then(function () { refresh(); highlightRow(f.id); });
+    else if (state.mode === "facts") { refresh(); highlightRow(f.id); }
     highlight(f.id);
   }
   function showThought(t) {
     state.selected = { kind: "thought", id: t.id };
+    if (state.mode !== "thoughts") { state.mode = "thoughts"; $("modeFacts").classList.remove("on"); $("modeThoughts").classList.add("on"); center("graph"); if (!state.thoughts.length) loadThoughts(); }
     var m = t.metadata || {};
     $("detail").innerHTML = '<h2>Thought · ' + when(t.createdAt) + '</h2><div class="claim">' + esc(t.content) + '</div><table class="kv">' +
       Object.keys(m).map(function (k) { var v = m[k]; return kv(k, Array.isArray(v) ? v.map(function (x) { return '<span class="tag">' + esc(x) + '</span>'; }).join("") : esc(typeof v === "object" ? JSON.stringify(v) : v)); }).join("") +
@@ -317,7 +373,7 @@ export const BROWSE_PAGE = String.raw`<!doctype html>
   }
   function setMode() {
     $("modeFacts").classList.toggle("on", state.mode === "facts"); $("modeThoughts").classList.toggle("on", state.mode === "thoughts");
-    if (state.mode === "thoughts") loadThoughts(); else draw();
+    if (state.mode === "thoughts") loadThoughts(); else refresh();
   }
 
   $("modeFacts").onclick = function () { state.mode = "facts"; setMode(); };
