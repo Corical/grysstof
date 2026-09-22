@@ -8,11 +8,12 @@
 import type { Assertion, Fact, FindOptions, Found, Ledger, Log, Scope, SubjectSummary } from "../../core/ports/mod.ts";
 import { type Embedder, vectorLiteral } from "../memory/vectors.ts";
 import { isUuid } from "../memory/shared.ts";
+import { occurredAtOf } from "./in-process.ts";
 import type { PostgresMemory } from "../memory/postgres.ts";
 
 type Row = {
   id: string; tenant: string; subject: string; claim: string; source: string; proof: string | null; tags: unknown;
-  learned_by: string; learned_at: Date | string; confirmed: boolean; confirmed_by: string | null; confirmed_at: Date | string | null;
+  learned_by: string; learned_at: Date | string; occurred_at?: Date | string | null; confirmed: boolean; confirmed_by: string | null; confirmed_at: Date | string | null;
   supersedes: string | null; superseded_by: string | null; similarity?: number | string;
 };
 
@@ -34,6 +35,7 @@ function toFact(r: Row): Fact {
     tags: Array.isArray(r.tags) ? (r.tags as unknown[]).filter((x): x is string => typeof x === "string") : [],
     learnedBy: r.learned_by,
     learnedAt: iso(r.learned_at)!,
+    ...(r.occurred_at ? { occurredAt: iso(r.occurred_at) } : {}),
     confirmed: r.confirmed === true,
     ...(r.confirmed_by ? { confirmedBy: r.confirmed_by } : {}),
     ...(r.confirmed_at ? { confirmedAt: iso(r.confirmed_at) } : {}),
@@ -42,7 +44,8 @@ function toFact(r: Row): Fact {
   };
 }
 
-const COLS = "id::text, tenant, subject, claim, source, proof, tags, learned_by, learned_at, confirmed, confirmed_by, confirmed_at, supersedes::text, superseded_by::text";
+const COLS = "id::text, tenant, subject, claim, source, proof, tags, learned_by, learned_at, occurred_at, confirmed, confirmed_by, confirmed_at, supersedes::text, superseded_by::text";
+const NEWEST_FIRST = "ORDER BY COALESCE(occurred_at, learned_at) DESC, learned_at DESC, seq DESC";
 
 export class PostgresLedger implements Ledger {
   /** `run` is the memory's guarded connection runner: same pool, same timeouts, same timeout logging. */
@@ -65,10 +68,10 @@ export class PostgresLedger implements Ledger {
       try {
         const older = a.supersedes ? await this.linkable(c, scope, a.supersedes, subject) : null;
         const r = await c.queryObject<Row>(
-          `INSERT INTO facts (tenant, subject, claim, source, proof, tags, learned_by, learned_at, supersedes, embedding, embedding_model, embedding_dims)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::timestamptz, $9::uuid, $10::vector, $11, $12)
+          `INSERT INTO facts (tenant, subject, claim, source, proof, tags, learned_by, learned_at, occurred_at, supersedes, embedding, embedding_model, embedding_dims)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::timestamptz, $13::timestamptz, $9::uuid, $10::vector, $11, $12)
            RETURNING ${COLS}`,
-          [scope.tenant, subject, claim, source, proof, JSON.stringify(tags), scope.actor, learnedAt, older?.id ?? null, vectorLiteral(embedding), this.embedder.model, this.embedder.dimensions],
+          [scope.tenant, subject, claim, source, proof, JSON.stringify(tags), scope.actor, learnedAt, older?.id ?? null, vectorLiteral(embedding), this.embedder.model, this.embedder.dimensions, occurredAtOf(a.occurredAt) ?? null],
         );
         const fact = toFact(r.rows[0]);
         if (older) await c.queryArray(`UPDATE facts SET superseded_by = $1::uuid WHERE id = $2::uuid AND tenant = $3`, [fact.id, older.id, scope.tenant]);
@@ -87,7 +90,7 @@ export class PostgresLedger implements Ledger {
     if (!s) return Promise.resolve(null);
     return this.run(async (c) => {
       const r = await c.queryObject<Row>(
-        `SELECT ${COLS} FROM facts WHERE tenant = $1 AND subject = $2 AND superseded_by IS NULL ORDER BY learned_at DESC, seq DESC LIMIT 1`,
+        `SELECT ${COLS} FROM facts WHERE tenant = $1 AND subject = $2 AND superseded_by IS NULL ${NEWEST_FIRST} LIMIT 1`,
         [scope.tenant, s],
       );
       return r.rows[0] ? toFact(r.rows[0]) : null;
@@ -98,7 +101,7 @@ export class PostgresLedger implements Ledger {
     const s = clean(subject);
     if (!s) return Promise.resolve([]);
     return this.run(async (c) => {
-      const r = await c.queryObject<Row>(`SELECT ${COLS} FROM facts WHERE tenant = $1 AND subject = $2 ORDER BY learned_at DESC, seq DESC`, [scope.tenant, s]);
+      const r = await c.queryObject<Row>(`SELECT ${COLS} FROM facts WHERE tenant = $1 AND subject = $2 ${NEWEST_FIRST}`, [scope.tenant, s]);
       return r.rows.map(toFact);
     });
   }

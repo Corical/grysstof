@@ -6,7 +6,7 @@
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Log, Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, fingerprint, isUuid, normalise, parseSince, tally } from "./shared.ts";
+import { boundLimit, bounds, createdAtOf, fingerprint, isUuid, normalise, parseSince, tally } from "./shared.ts";
 import type { Embedder } from "./vectors.ts";
 
 type DbRow = { id: string; content: string; metadata: ThoughtMetadata; created_at: string; updated_at?: string | null; similarity?: number };
@@ -29,7 +29,12 @@ export class SupabaseMemory implements Memory {
     const { id } = data as { id: string };
     const { data: existing } = await this.client.from("thoughts").select("embedding").eq("id", id).maybeSingle();
     const alreadyKnown = !!existing?.embedding;
-    const { error: embError } = await this.client.from("thoughts").update({ embedding }).eq("id", id);
+    const patch: Record<string, unknown> = { embedding };
+    if (!alreadyKnown) {
+      const at = createdAtOf(metadata, "");
+      if (at) patch.created_at = at;
+    }
+    const { error: embError } = await this.client.from("thoughts").update(patch).eq("id", id);
     if (embError) throw new Error(embError.message);
     this.log.info("memory.remembered", { memory: "supabase", id, alreadyKnown });
     return { id, alreadyKnown };

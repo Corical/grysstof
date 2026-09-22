@@ -9,7 +9,7 @@
 /// <reference path="./node-sqlite.d.ts" />
 import { DatabaseSync } from "node:sqlite";
 import type { Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, fingerprint, normalise, parseSince, tally } from "./shared.ts";
+import { boundLimit, bounds, createdAtOf, fingerprint, normalise, parseSince, tally } from "./shared.ts";
 import { cosine, type Embedder } from "./vectors.ts";
 
 type Row = { id: string; tenant: string; content: string; metadata: string; created_at: string; updated_at: string; fingerprint: string; embedding: Uint8Array | null };
@@ -85,7 +85,7 @@ export class SqliteMemory implements Memory {
       const id = crypto.randomUUID();
       this.db.prepare(
         "INSERT INTO thoughts (id, tenant, content, metadata, created_at, updated_at, fingerprint, embedding, embedding_model, embedding_dims, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ).run(id, scope.tenant, content, JSON.stringify(metadata), now, now, fp, toBlob(vector), this.embedder.model, this.embedder.dimensions, ++this.seq);
+      ).run(id, scope.tenant, content, JSON.stringify(metadata), createdAtOf(metadata, now), now, fp, toBlob(vector), this.embedder.model, this.embedder.dimensions, ++this.seq);
       return { id, alreadyKnown: false };
     });
   }

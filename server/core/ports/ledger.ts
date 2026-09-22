@@ -24,9 +24,13 @@
  *    An assertion carrying such keys has them ignored.
  *  - `tenant` partitions everything. No verb may read or link a line of
  *    another tenant; `supersede` and `confirm` refuse with an Error.
+ *  - A line's place in time is `occurredAt` when the writer gave one (an
+ *    import of history), else `learnedAt`. `occurredAt` must parse as a date
+ *    or the assert is refused; it is stored normalised to ISO 8601.
  *  - `latest(subject)` is the newest line for the subject that has not been
  *    superseded; `history(subject)` is every line for the subject, newest
- *    first, superseded ones included and marked.
+ *    first by place in time (then `learnedAt`, then id), superseded ones
+ *    included and marked.
  *  - `supersede(newer, older)` links two existing lines of the same tenant
  *    and subject. It refuses: a different tenant, a different subject, the
  *    same line twice, an older line already superseded by another, and any
@@ -65,6 +69,8 @@ export type Assertion = {
   tags?: string[];
   /** Id of the older line this one replaces; validated exactly as `supersede` does. */
   supersedes?: string;
+  /** When the thing claimed became true (ISO 8601), for imported history. Absent: unknown, treated as `learnedAt`. */
+  occurredAt?: string;
 };
 
 export type Fact = {
@@ -77,6 +83,7 @@ export type Fact = {
   tags: string[];
   learnedBy: string;
   learnedAt: string; // ISO 8601
+  occurredAt?: string; // ISO 8601, when the claim became true; the line's place in time
   confirmed: boolean;
   confirmedBy?: string;
   confirmedAt?: string; // ISO 8601

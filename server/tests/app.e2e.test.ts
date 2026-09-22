@@ -45,8 +45,34 @@ Deno.test("initialize and tools/list expose the six upstream tools plus the ledg
   const list = await rpc(app, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
   assertEquals(list.body.result.tools.map((t: { name: string }) => t.name).sort(), [...UPSTREAM_TOOLS, ...LEDGER_TOOLS].sort());
   const capture = list.body.result.tools.find((t: { name: string }) => t.name === "capture_thought");
-  assertEquals(Object.keys(capture.inputSchema.properties).sort(), ["content", "proof", "source", "subject"]);
+  assertEquals(Object.keys(capture.inputSchema.properties).sort(), ["content", "occurred_at", "proof", "source", "subject"]);
   assertEquals(capture.inputSchema.required, ["content"]);
+});
+
+Deno.test("capture_thought with occurred_at dates the thought to then, not now; a garbage occurred_at is refused before anything is stored", async () => {
+  const app = buildApp(ports(new KeywordMemory(), { log: new RecordingLog() }), OPTIONS);
+  const ok = await call(app, 1, "capture_thought", { content: "Soft go-live postponed, devices not issued", occurred_at: "2026-08-31T07:15:00Z" });
+  assertEquals(ok.result.isError, undefined);
+  const found = await call(app, 2, "search_thoughts", { query: "go-live postponed", threshold: 0 });
+  assert(found.result.content[0].text.includes("Captured: 2026-08-31"), found.result.content[0].text);
+  const bad = await call(app, 3, "capture_thought", { content: "Schedules outstanding", occurred_at: "last Tuesday" });
+  assertEquals(bad.result.isError, true);
+  const stats = await call(app, 4, "thought_stats", {});
+  assert(stats.result.content[0].text.includes("Total thoughts: 1"), stats.result.content[0].text);
+});
+
+Deno.test("capture_thought with a subject and occurred_at dates the ledger line; fact_history shows Occurred and orders by it", async () => {
+  const app = buildApp(ports(new KeywordMemory(), { log: new RecordingLog() }), OPTIONS);
+  const later = await call(app, 1, "capture_thought", { content: "Go-live moved to 2 March", subject: "client:acme", source: "discord:a/b/1", occurred_at: "2026-02-20" });
+  assertEquals(later.result.isError, undefined);
+  const earlier = await call(app, 2, "capture_thought", { content: "Go-live set for 26 January", subject: "client:acme", source: "discord:a/b/2", occurred_at: "2026-01-19T10:00:00Z" });
+  assertEquals(earlier.result.isError, undefined);
+  const h = await call(app, 3, "fact_history", { subject: "client:acme" });
+  const text: string = h.result.content[0].text;
+  assertStringIncludes(text, "Occurred: 2026-02-20T00:00:00.000Z");
+  assert(text.indexOf("Go-live moved to 2 March") < text.indexOf("Go-live set for 26 January"), "February line before January line although learned second");
+  const bad = await call(app, 4, "capture_thought", { content: "x", subject: "client:acme", source: "s", occurred_at: "yesterday-ish" });
+  assertEquals(bad.result.isError, true);
 });
 
 Deno.test("capture_thought with a subject records a ledger line every time; without one it is the old merging thought", async () => {

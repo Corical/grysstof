@@ -259,12 +259,15 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
           "What the content is a fact about (e.g. \"client:acme\", \"person:sam\", \"repo:dataservice\"). When given, the content is recorded as a fact in the ledger: a new line every time, never merged, older lines kept.",
         ),
         proof: z.string().max(1000).optional().describe("A link to the evidence for the fact."),
+        occurred_at: z.string().max(40).optional().describe(
+          "When this actually happened, ISO 8601, for importing history. The thought is dated to it instead of to now.",
+        ),
       },
     },
-    async ({ content, source, subject, proof }) => {
+    async ({ content, source, subject, proof, occurred_at }) => {
       try {
         called("capture_thought");
-        const done = await capture(ports, scope, { content, source, subject, proof });
+        const done = await capture(ports, scope, { content, source, subject, proof, occurredAt: occurred_at });
         const { understood } = done;
         let confirmation = done.kind === "fact"
           ? `Recorded fact ${done.id} about ${done.fact.subject} (from ${done.fact.source}, by ${done.fact.learnedBy}, unconfirmed)`
@@ -287,6 +290,7 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
       `--- Fact ${f.id}${score !== undefined ? ` (${(score * 100).toFixed(1)}% match)` : ""} ---`,
       `Subject: ${oneLine(f.subject)}`,
       `Learned: ${f.learnedAt} by ${oneLine(f.learnedBy)}`,
+      ...(f.occurredAt ? [`Occurred: ${f.occurredAt}`] : []),
       `Source: ${oneLine(f.source)}`,
     ];
     if (f.proof) head.push(`Proof: ${oneLine(f.proof)}`);

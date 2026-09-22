@@ -9,7 +9,7 @@ import type { Log } from "../../core/ports/mod.ts";
 
 export const MIGRATIONS = new URL("../../sql/migrations/", import.meta.url);
 /** The version this build of the code expects. Bump when a migration is added. */
-export const LATEST_SCHEMA = 4;
+export const LATEST_SCHEMA = 5;
 
 type Client = Awaited<ReturnType<Pool["connect"]>>;
 

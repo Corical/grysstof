@@ -72,7 +72,7 @@ try {
   const briefing = current.map((b) => {
     const learned = /^Learned: (\S+) by (\S+)/m.exec(b);
     const source = /^Source: (.*)$/m.exec(b)?.[1] ?? "";
-    const claim = b.split("\n").filter((l) => l && !/^(--- Fact|Subject:|Status:|Learned:|Source:|Proof:|Tags:|Confirmed|Supersedes)/.test(l)).join(" ").trim();
+    const claim = b.split("\n").filter((l) => l && !/^(--- Fact|Subject:|Status:|Learned:|Occurred:|Source:|Proof:|Tags:|Confirmed|Supersedes)/.test(l)).join(" ").trim();
     return `- ${claim}${learned ? ` (${learned[1].slice(0, 10)}, ${learned[2]}${source ? `, ${source}` : ""})` : ""}`;
   }).join("\n");
   const context = `Grysstof ledger — what earlier sessions in ${subject.slice("project:".length)} recorded (${count} line(s), newest first, ${current.length} shown; call fact_history "${subject}" on grysstof-personal for all):\n${briefing}`;

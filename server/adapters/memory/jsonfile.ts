@@ -6,7 +6,7 @@
  * survives a restart. Fine for thousands of thoughts, not for millions.
  */
 import type { Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, normalise, parseSince, tally } from "./shared.ts";
+import { boundLimit, bounds, createdAtOf, normalise, parseSince, tally } from "./shared.ts";
 import { cosine, type Embedder } from "./vectors.ts";
 
 type Row = Thought & { key: string; vector: number[]; seq: number };
@@ -103,7 +103,7 @@ export class JsonFileMemory implements Memory {
       }
       const vector = await this.embedder.embed(content);
       const seq = ++f.seq;
-      const row: Row = { id: newId(seq), content, metadata: structuredClone(metadata), createdAt: now, updatedAt: now, key, vector, seq };
+      const row: Row = { id: newId(seq), content, metadata: structuredClone(metadata), createdAt: createdAtOf(metadata, now), updatedAt: now, key, vector, seq };
       f.rows.push(row);
       await this.save(scope, f);
       return { id: row.id, alreadyKnown: false };

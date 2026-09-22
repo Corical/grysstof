@@ -5,7 +5,7 @@
  * by tenant, so it is also the reference multi-tenant implementation.
  */
 import type { Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, normalise, parseSince, tally } from "./shared.ts";
+import { boundLimit, bounds, createdAtOf, normalise, parseSince, tally } from "./shared.ts";
 
 type Row = Thought & { key: string; words: Set<string>; seq: number };
 
@@ -58,7 +58,7 @@ export class KeywordMemory implements Memory {
       }
     }
     const id = crypto.randomUUID();
-    b.set(id, { id, content, metadata: structuredClone(metadata), createdAt: now, updatedAt: now, key, words: words(content), seq: ++this.seq });
+    b.set(id, { id, content, metadata: structuredClone(metadata), createdAt: createdAtOf(metadata, now), updatedAt: now, key, words: words(content), seq: ++this.seq });
     return Promise.resolve({ id, alreadyKnown: false });
   }
 

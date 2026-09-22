@@ -36,6 +36,21 @@ export function runMemoryContract(name: string, make: MemoryFactory) {
     assert(!Number.isNaN(Date.parse(got.createdAt)));
   });
 
+  t("a thought with metadata.occurred_at is dated to it; a bad or missing one is dated to now; a merge never re-dates", async (m) => {
+    const before = Date.now() - 1000;
+    const { id } = await m.remember(A, "Rollout postponed, devices not issued", { type: "observation", occurred_at: "2026-08-31T07:15:00Z" });
+    assertEquals((await m.get(A, id))!.createdAt, "2026-08-31T07:15:00.000Z");
+    const bad = await m.remember(A, "Schedules still outstanding", { occurred_at: "last Tuesday" });
+    assert(Date.parse((await m.get(A, bad.id))!.createdAt) >= before);
+    const none = await m.remember(A, "NFC pricing shared", {});
+    assert(Date.parse((await m.get(A, none.id))!.createdAt) >= before);
+    const again = await m.remember(A, "Rollout postponed, devices not issued", { occurred_at: "2020-01-01T00:00:00Z" });
+    assertEquals(again.alreadyKnown, true);
+    assertEquals((await m.get(A, id))!.createdAt, "2026-08-31T07:15:00.000Z");
+    const recent = await m.recent(A, { since: "2026-08-01", limit: 50 });
+    assert(recent.some((r) => r.id === id));
+  });
+
   t("remembering the same thought again is alreadyKnown, same id, metadata merged", async (m) => {
     const a = await m.remember(A, "Hello   World", { type: "idea", topics: ["a"] });
     const b = await m.remember(A, "  hello world ", { people: ["Mike"] });

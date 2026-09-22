@@ -9,6 +9,19 @@
  */
 import type { Assertion, Fact, FindOptions, Found, Ledger, Scope, SubjectSummary } from "../../core/ports/mod.ts";
 
+import { cosine, type Embedder } from "../memory/vectors.ts";
+
+/** Where a line sits in time: when it became true if the writer said, else when it was learned. */
+export const placeInTime = (f: Fact): string => f.occurredAt ?? f.learnedAt;
+
+/** A writer's occurredAt normalised to ISO, undefined when absent, an Error when it is not a date. */
+export function occurredAtOf(v: string | undefined): string | undefined {
+  if (v === undefined || v === null || v.trim() === "") return undefined;
+  const t = Date.parse(v);
+  if (Number.isNaN(t)) throw new Error(`occurredAt is not a date: ${v}`);
+  return new Date(t).toISOString();
+}
+
 export type Event =
   | { kind: "assert"; fact: Fact }
   | { kind: "confirm"; tenant: string; id: string; by: string; at: string }
@@ -34,8 +47,22 @@ function jaccard(a: Set<string>, b: Set<string>): number {
 export class InProcessLedger implements Ledger {
   private readonly tenants = new Map<string, Map<string, Fact>>();
   private seq = 0;
+  /** Claim vectors by fact id, when an embedder is present. A line without one falls back to word overlap. */
+  protected readonly vectors = new Map<string, number[]>();
 
-  constructor(protected readonly now: () => Date = () => new Date()) {}
+  constructor(protected readonly now: () => Date = () => new Date(), protected readonly embedder?: Embedder) {}
+
+  /** Subclasses that persist vectors override this; the default keeps them in memory only. */
+  protected storeVector(_id: string, _vector: number[]): Promise<void> {
+    return Promise.resolve();
+  }
+
+  private async embedFact(fact: Fact): Promise<void> {
+    if (!this.embedder || this.vectors.has(fact.id)) return;
+    const v = await this.embedder.embed(fact.claim);
+    this.vectors.set(fact.id, v);
+    await this.storeVector(fact.id, v);
+  }
 
   private lines(tenant: string): Map<string, Fact> {
     let m = this.tenants.get(tenant);
@@ -85,6 +112,7 @@ export class InProcessLedger implements Ledger {
     const proof = clean(a.proof) || undefined;
     const tags = [...new Set((a.tags ?? []).map(clean).filter(Boolean))];
     const older = a.supersedes ? this.linkable(scope, a.supersedes, subject) : null;
+    const occurredAt = occurredAtOf(a.occurredAt);
     const fact: Fact = {
       id: `fact_${(++this.seq).toString(36).padStart(6, "0")}_${crypto.randomUUID().slice(0, 8)}`,
       tenant: scope.tenant,
@@ -95,10 +123,12 @@ export class InProcessLedger implements Ledger {
       tags,
       learnedBy: scope.actor,
       learnedAt: this.now().toISOString(),
+      ...(occurredAt ? { occurredAt } : {}),
       confirmed: false,
       ...(older ? { supersedes: older.id } : {}),
     };
     await this.record({ kind: "assert", fact });
+    await this.embedFact(fact);
     return this.copy(scope, fact.id)!;
   }
 
@@ -110,7 +140,7 @@ export class InProcessLedger implements Ledger {
     const s = clean(subject);
     if (!s) return Promise.resolve([]);
     return Promise.resolve(
-      [...this.lines(scope.tenant).values()].filter((f) => f.subject === s).sort((a, b) => b.learnedAt.localeCompare(a.learnedAt) || b.id.localeCompare(a.id)).map((f) => structuredClone(f)),
+      [...this.lines(scope.tenant).values()].filter((f) => f.subject === s).sort((a, b) => placeInTime(b).localeCompare(placeInTime(a)) || b.learnedAt.localeCompare(a.learnedAt) || b.id.localeCompare(a.id)).map((f) => structuredClone(f)),
     );
   }
 
@@ -136,22 +166,24 @@ export class InProcessLedger implements Ledger {
     return this.copy(scope, newer.id)!;
   }
 
-  find(scope: Scope, query: string, opts: FindOptions): Promise<Found[]> {
+  async find(scope: Scope, query: string, opts: FindOptions): Promise<Found[]> {
     const limit = Number.isFinite(opts.limit) ? Math.max(0, Math.floor(opts.limit)) : 0;
-    if (limit === 0 || !clean(query)) return Promise.resolve([]);
+    if (limit === 0 || !clean(query)) return [];
     const minScore = Number.isNaN(opts.minScore ?? 0) ? 0 : Math.min(1, Math.max(0, opts.minScore ?? 0));
     const subject = clean(opts.subject) || undefined;
     const q = words(query);
+    const qv = this.embedder ? await this.embedder.embed(query) : undefined;
     const out: Found[] = [];
     for (const f of this.lines(scope.tenant).values()) {
       if (subject && f.subject !== subject) continue;
       if (!opts.includeSuperseded && f.supersededBy) continue;
       if (opts.confirmedOnly && !f.confirmed) continue;
-      const score = jaccard(q, words(f.claim));
+      const fv = qv ? this.vectors.get(f.id) : undefined;
+      const score = fv && qv ? Math.max(0, Math.min(1, cosine(qv, fv))) : jaccard(q, words(f.claim));
       if (score > minScore) out.push({ ...structuredClone(f), score });
     }
     out.sort((a, b) => b.score - a.score || b.learnedAt.localeCompare(a.learnedAt));
-    return Promise.resolve(out.slice(0, limit));
+    return out.slice(0, limit);
   }
 
   subjects(scope: Scope): Promise<SubjectSummary[]> {

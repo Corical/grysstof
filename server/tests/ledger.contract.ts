@@ -49,6 +49,27 @@ export function runLedgerContract(name: string, make: LedgerFactory) {
     assertEquals(again, f);
   });
 
+  t("occurredAt: stored normalised, orders history and latest by place in time over the clock; absent falls back to learnedAt; garbage is refused", async (l) => {
+    const feb = await l.assert(A, { subject: "client:servest", claim: "Schedules handed to the client admin team", source: "discord:1/2/3", occurredAt: "2026-02-25" });
+    await tick();
+    const jan = await l.assert(A, { subject: "client:servest", claim: "File13 took on manual schedule creation", source: "discord:1/2/4", occurredAt: "2026-01-26T10:00:00+02:00" });
+    await tick();
+    const now = await l.assert(A, { subject: "client:servest", claim: "Learned just now, no event date", source: "discord:1/2/5" });
+    assertEquals(feb.occurredAt, "2026-02-25T00:00:00.000Z");
+    assertEquals(jan.occurredAt, "2026-01-26T08:00:00.000Z");
+    assertEquals(now.occurredAt, undefined);
+    const h = await l.history(A, "client:servest");
+    assertEquals(h.map((f) => f.id), [now.id, feb.id, jan.id], "newest place in time first, not insertion order");
+    assertEquals((await l.latest(A, "client:servest"))!.id, now.id);
+    await l.supersede(A, feb.id, now.id);
+    assertEquals((await l.latest(A, "client:servest"))!.id, feb.id, "latest skips the superseded line whatever its date");
+    await assertRejects(() => l.assert(A, { subject: "client:servest", claim: "x", source: "s", occurredAt: "last Tuesday" }), Error, "occurredAt");
+    assertEquals((await l.history(A, "client:servest")).length, 3, "a refused assert stores nothing");
+    const back = await l.assert(A, { subject: "client:servest", claim: "Backdated after the fact", source: "s", occurredAt: "2020-01-01", supersedes: jan.id });
+    assertEquals((await l.history(A, "client:servest")).at(-1)!.id, back.id, "a 2020 line sorts last even though it was learned last");
+    assertEquals((await l.history(A, "client:servest")).find((f) => f.id === jan.id)!.supersededBy, back.id);
+  });
+
   t("a fact needs a subject, a claim and a source; blanks are refused and nothing is stored", async (l) => {
     for (const bad of [
       { subject: "", claim: "c", source: "s" },

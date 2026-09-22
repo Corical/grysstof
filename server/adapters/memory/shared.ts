@@ -27,6 +27,14 @@ export function bounds(opts: { limit: number; minScore: number }): { limit: numb
 
 export const boundLimit = (limit: number): number => bounds({ limit, minScore: 0 }).limit;
 
+/** A thought is dated to when it happened (metadata.occurred_at, set by capture for imports) when that is a real date, else to now. */
+export function createdAtOf(metadata: ThoughtMetadata, now: string): string {
+  const v = metadata.occurred_at;
+  if (typeof v !== "string") return now;
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? now : new Date(t).toISOString();
+}
+
 /** Port rule: `since` is ISO 8601 or absent; anything else is the caller's error, not a silent empty result. */
 export function parseSince(since: string | undefined): number | null {
   if (since === undefined) return null;

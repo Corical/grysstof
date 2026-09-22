@@ -13,6 +13,8 @@ export type CaptureInput = {
   /** Present: the content is a claim about this subject and goes to the ledger. */
   subject?: string;
   proof?: string;
+  /** When the thing being captured actually happened (ISO 8601), for imports of history. Defaults to now. */
+  occurredAt?: string;
   /** Extra metadata a writer knows (file path, ticket id). Never provenance: those keys are dropped. */
   metadata?: ThoughtMetadata;
 };
@@ -29,6 +31,11 @@ export async function capture(ports: Pick<Ports, "memory" | "ledger" | "understa
   const source = input.source?.trim() || "mcp";
   const extra: ThoughtMetadata = {};
   for (const [k, v] of Object.entries(input.metadata ?? {})) if (!PROVENANCE_KEYS.has(k)) extra[k] = v;
+  if (input.occurredAt !== undefined) {
+    const t = Date.parse(input.occurredAt);
+    if (Number.isNaN(t)) throw new Error(`occurred_at is not a date: ${input.occurredAt}`);
+    extra.occurred_at = new Date(t).toISOString();
+  }
 
   const understood = await ports.understander.understand(content);
 
@@ -39,6 +46,7 @@ export async function capture(ports: Pick<Ports, "memory" | "ledger" | "understa
       source,
       proof: input.proof?.trim() || undefined,
       tags: [...understood.topics, ...understood.people.map((p) => `person:${p}`)],
+      ...(typeof extra.occurred_at === "string" ? { occurredAt: extra.occurred_at } : {}),
     });
     ports.log.info("fact.asserted", { id: fact.id, subject: fact.subject, source, tenant: scope.tenant, actor: scope.actor });
     return { kind: "fact", id: fact.id, fact, understood };

@@ -4,7 +4,7 @@
  * port as KeywordMemory. Single-tenant: ignores scope.
  */
 import type { Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, normalise, parseSince, tally } from "./shared.ts";
+import { boundLimit, bounds, createdAtOf, normalise, parseSince, tally } from "./shared.ts";
 import { cosine, type Embedder } from "./vectors.ts";
 
 type Row = Thought & { key: string; vector: number[]; seq: number };
@@ -31,7 +31,7 @@ export class VectorMemory implements Memory {
       }
       const vector = await this.embedder.embed(content);
       const id = crypto.randomUUID();
-      this.rows.set(id, { id, content, metadata: structuredClone(metadata), createdAt: now, updatedAt: now, key, vector, seq: ++this.seq });
+      this.rows.set(id, { id, content, metadata: structuredClone(metadata), createdAt: createdAtOf(metadata, now), updatedAt: now, key, vector, seq: ++this.seq });
       return { id, alreadyKnown: false };
     });
     this.chain = next.catch(() => {});

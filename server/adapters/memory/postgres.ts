@@ -12,7 +12,7 @@
  */
 import { Pool } from "postgres";
 import type { Log, Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, isUuid, normalise, parseSince, tally, fingerprint } from "./shared.ts";
+import { boundLimit, bounds, createdAtOf, isUuid, normalise, parseSince, tally, fingerprint } from "./shared.ts";
 import { type Embedder, vectorLiteral } from "./vectors.ts";
 import { LATEST_SCHEMA, schemaVersion, vectorWidth } from "./postgres-migrate.ts";
 
@@ -132,9 +132,10 @@ export class PostgresMemory implements Memory {
         );
         const { id, inserted } = r.rows[0].result;
         if (inserted) {
+          const at = createdAtOf(metadata, "");
           await c.queryArray(
-            `UPDATE thoughts SET embedding = $1::vector, embedding_model = $2, embedding_dims = $3 WHERE id = $4::uuid AND tenant = $5`,
-            [vectorLiteral(embedding), this.embedder.model, this.embedder.dimensions, id, scope.tenant],
+            `UPDATE thoughts SET embedding = $1::vector, embedding_model = $2, embedding_dims = $3, created_at = COALESCE($6::timestamptz, created_at) WHERE id = $4::uuid AND tenant = $5`,
+            [vectorLiteral(embedding), this.embedder.model, this.embedder.dimensions, id, scope.tenant, at || null],
           );
         }
         await c.queryArray("COMMIT");
