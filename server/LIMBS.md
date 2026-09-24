@@ -53,7 +53,7 @@ The example is a memory on Microsoft SQL Server. Every other socket follows the 
 
 - `remember` with content the memory already holds returns the existing id with `alreadyKnown: true` and merges metadata. "Already holds" is your notion; every shipped limb uses the fingerprint in [`adapters/memory/shared.ts`](adapters/memory/shared.ts) (lower-cased, whitespace-collapsed, Unicode-normalised). Use it.
 - `recall` scores are in `[0, 1]`; only strictly greater than `minScore` comes back. `limit` and `minScore` bounds are shared code (`bounds()` in `shared.ts`); call it, do not reimplement it.
-- `recent` filters are AND-ed; `since` that is not ISO 8601 is an `Error`, never an empty list.
+- `recent` filters are AND-ed; `since` (inclusive) or `until` (exclusive) that is not ISO 8601 is an `Error`, never an empty list. It orders by **created-at** (when the thought happened, `metadata.occurred_at` for imports), not by when it was stored, with a tie-break that is stable across calls so `offset` paging never repeats or skips a row and `order: "oldest"` is exactly the reverse of `"newest"`. `channel` equals `metadata.channel` ignoring case, outer spaces and one leading `#`: never a prefix, never a wildcard. A limb that holds rows in process gets all of this from `recentWindow()` in `shared.ts`; a SQL limb must match it (see `postgres.ts`).
 - `isolation` is `"tenant"` if you partition by `scope.tenant`, `"none"` if you hold one tenant's thoughts and ignore it. Compose refuses a `"none"` memory behind a gate that admits many tenants.
 - Blank content is an `Error`. Ids are opaque strings you hand back unchanged.
 
@@ -74,8 +74,8 @@ export class MssqlMemory implements Memory {
   async known(scope: Scope, content: string) { /* fingerprint lookup, no embedding */ }
   async recall(scope: Scope, query: string, opts: { limit: number; minScore: number }) { /* embed query, cosine, bounds() */ }
   async get(scope: Scope, id: string) { /* by id within tenant, else null */ }
-  async recent(scope: Scope, q: RecentQuery) { /* newest first, filters AND-ed, parseSince(q.since) */ }
-  async summary(scope: Scope) { /* count, oldest, newest, tally() of types/topics/people */ }
+  async recent(scope: Scope, q: RecentQuery) { /* by created-at + stable tie-break, filters AND-ed, parseSince/parseUntil, offset, order */ }
+  async summary(scope: Scope) { /* count, oldest and newest by created-at (spanOf), tally() of types/topics/people */ }
 }
 ```
 

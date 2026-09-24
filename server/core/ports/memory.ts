@@ -28,10 +28,17 @@
  *    down). `minScore` is clamped into [0, 1] (so +Infinity matches nothing);
  *    a NaN `minScore` is 0.
  *    Every implementation applies these identically (adapters/memory/shared.ts).
- *  - `recent` returns newest first; every given filter must match
+ *  - `recent` orders by created-at (when the thought happened, which for
+ *    imports is metadata.occurred_at, not when it was stored): newest first
+ *    unless `order` is "oldest". Ties are broken by a key that is stable
+ *    across calls, so `offset` paging never repeats or skips a thought and
+ *    "oldest" is exactly "newest" reversed. Every given filter must match
  *    (`type` equals, `topic` is one of the thought's topics, `person` is one
- *    of its people, `since` is created-at-or-after). `since` must be ISO 8601;
+ *    of its people, `since` is created-at-or-after, `until` is created
+ *    strictly before, `channel` equals metadata.channel ignoring case, outer
+ *    spaces and one leading #). `since` and `until` must be ISO 8601;
  *    anything else is rejected with an Error, never a silent empty result.
+ *    `offset` is bounded exactly like `limit`.
  *  - `summary` never returns the thoughts themselves, only aggregates.
  *  - Errors are thrown as ordinary Errors with a message safe to show a user.
  *
@@ -65,9 +72,18 @@ export type RecentQuery = {
   type?: string;
   topic?: string;
   person?: string;
-  since?: string; // ISO 8601
+  /** Created at or after this instant (inclusive). ISO 8601. */
+  since?: string;
+  /** Created strictly before this instant (exclusive), so since/until windows tile without overlap. ISO 8601. */
+  until?: string;
   /** Only thoughts whose metadata.source starts with this, e.g. "discord:<guild>/<channel>/" for one channel. */
   sourcePrefix?: string;
+  /** Only thoughts whose metadata.channel is this name: any case, a leading # ignored, never a prefix or a wildcard. */
+  channel?: string;
+  /** "newest" (default) or "oldest" first, by created-at; ties broken by a key stable across calls. */
+  order?: "newest" | "oldest";
+  /** Skip this many matches first, for paging. Bounded like limit: a whole number ≥ 0. */
+  offset?: number;
 };
 
 export type Summary = {

@@ -6,7 +6,7 @@
  */
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Log, Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, createdAtOf, fingerprint, isUuid, normalise, parseSince, tally } from "./shared.ts";
+import { boundLimit, bounds, channelKey, createdAtOf, fingerprint, isUuid, normalise, parseSince, parseUntil, tally } from "./shared.ts";
 import type { Embedder } from "./vectors.ts";
 
 type DbRow = { id: string; content: string; metadata: ThoughtMetadata; created_at: string; updated_at?: string | null; similarity?: number };
@@ -71,13 +71,26 @@ export class SupabaseMemory implements Memory {
 
   async recent(_scope: Scope, q: RecentQuery): Promise<Thought[]> {
     const since = parseSince(q.since);
+    const until = parseUntil(q.until);
+    const limit = boundLimit(q.limit);
+    const offset = boundLimit(q.offset ?? 0);
+    if (limit === 0) return [];
+    const ascending = q.order === "oldest";
     let sel = this.client.from("thoughts").select("id, content, metadata, created_at, updated_at")
-      .order("created_at", { ascending: false }).limit(boundLimit(q.limit));
+      .order("created_at", { ascending }).order("id", { ascending }).range(offset, offset + limit - 1);
     if (q.type) sel = sel.contains("metadata", { type: q.type });
     if (q.topic) sel = sel.contains("metadata", { topics: [q.topic] });
     if (q.person) sel = sel.contains("metadata", { people: [q.person] });
     if (q.sourcePrefix !== undefined) sel = sel.like("metadata->>source", q.sourcePrefix.replace(/[\\%_]/g, (c) => `\\${c}`) + "%");
+    if (q.channel !== undefined) {
+      const want = channelKey(q.channel);
+      if (want === undefined) return [];
+      // PostgREST cannot trim or lower a JSON field, so this is a case-insensitive exact match on the stored name;
+      // writers store it bare ("queries"), which is what channelKey compares against elsewhere. Wildcards escaped.
+      sel = sel.ilike("metadata->>channel", want.replace(/[\\%_*]/g, (c) => `\\${c}`));
+    }
     if (since !== null) sel = sel.gte("created_at", new Date(since).toISOString());
+    if (until !== null) sel = sel.lt("created_at", new Date(until).toISOString());
     const { data, error } = await sel;
     if (error) throw new Error(error.message);
     return ((data ?? []) as DbRow[]).map(toThought);

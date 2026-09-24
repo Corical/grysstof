@@ -3,7 +3,7 @@
  * the input bounds the port promises, the id and timestamp guards, and the
  * summary tally. Adapter-side only; the core never sees this file.
  */
-import type { Summary, ThoughtMetadata } from "../../core/ports/mod.ts";
+import type { RecentQuery, Summary, ThoughtMetadata } from "../../core/ports/mod.ts";
 
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -35,12 +35,65 @@ export function createdAtOf(metadata: ThoughtMetadata, now: string): string {
   return Number.isNaN(t) ? now : new Date(t).toISOString();
 }
 
-/** Port rule: `since` is ISO 8601 or absent; anything else is the caller's error, not a silent empty result. */
-export function parseSince(since: string | undefined): number | null {
-  if (since === undefined) return null;
-  const t = Date.parse(since);
-  if (Number.isNaN(t) || !/^\d{4}-\d{2}-\d{2}/.test(since)) throw new Error(`since must be an ISO 8601 timestamp, got "${since}"`);
+/** Port rule: an instant is ISO 8601 or absent; anything else is the caller's error, not a silent empty result. */
+function parseInstant(name: string, value: string | undefined): number | null {
+  if (value === undefined) return null;
+  const t = Date.parse(value);
+  if (Number.isNaN(t) || !/^\d{4}-\d{2}-\d{2}/.test(value)) throw new Error(`${name} must be an ISO 8601 timestamp, got "${value}"`);
   return t;
+}
+
+export const parseSince = (since: string | undefined): number | null => parseInstant("since", since);
+export const parseUntil = (until: string | undefined): number | null => parseInstant("until", until);
+
+/** A channel name as the port compares it: trimmed, one leading # dropped, lower case. Anything but a non-blank string has no channel. */
+export function channelKey(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const k = v.trim().replace(/^#/, "").trim().toLowerCase();
+  return k || undefined;
+}
+
+/** Every `recent` filter except the time window, on one thought's metadata. */
+export function matchesRecent(meta: ThoughtMetadata, q: RecentQuery): boolean {
+  if (q.type !== undefined && meta.type !== q.type) return false;
+  if (q.topic !== undefined && !(Array.isArray(meta.topics) && meta.topics.includes(q.topic))) return false;
+  if (q.person !== undefined && !(Array.isArray(meta.people) && meta.people.includes(q.person))) return false;
+  if (q.sourcePrefix !== undefined && !(typeof meta.source === "string" && meta.source.startsWith(q.sourcePrefix))) return false;
+  if (q.channel !== undefined) {
+    const want = channelKey(q.channel);
+    if (want === undefined || channelKey(meta.channel) !== want) return false;
+  }
+  return true;
+}
+
+/**
+ * The whole `recent` rule for memories that hold rows in process: filter,
+ * window, order by created-at with `seq` (insertion order) breaking ties so
+ * paging is stable and "oldest" is exactly "newest" reversed, then offset
+ * and limit. Throws on a malformed since or until.
+ */
+export function recentWindow<R extends { createdAt: string; metadata: ThoughtMetadata; seq: number }>(rows: Iterable<R>, q: RecentQuery): R[] {
+  const since = parseSince(q.since);
+  const until = parseUntil(q.until);
+  const limit = boundLimit(q.limit);
+  const offset = boundLimit(q.offset ?? 0);
+  const newestFirst = q.order !== "oldest";
+  const at = (r: R) => Date.parse(r.createdAt);
+  return [...rows]
+    .filter((r) => matchesRecent(r.metadata, q))
+    .filter((r) => (since === null || at(r) >= since) && (until === null || at(r) < until))
+    .sort((a, b) => (at(a) - at(b) || a.seq - b.seq) * (newestFirst ? -1 : 1))
+    .slice(offset, offset + limit);
+}
+
+/** Oldest and newest by created-at, whatever order the rows are held in. */
+export function spanOf(createdAts: Iterable<string>): { oldest?: string; newest?: string } {
+  let oldest: string | undefined, newest: string | undefined;
+  for (const c of createdAts) {
+    if (oldest === undefined || Date.parse(c) < Date.parse(oldest)) oldest = c;
+    if (newest === undefined || Date.parse(c) > Date.parse(newest)) newest = c;
+  }
+  return oldest === undefined ? {} : { oldest, newest };
 }
 
 export function tally(s: Summary, m: ThoughtMetadata): void {

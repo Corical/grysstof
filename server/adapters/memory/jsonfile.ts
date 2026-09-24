@@ -6,7 +6,7 @@
  * survives a restart. Fine for thousands of thoughts, not for millions.
  */
 import type { Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, createdAtOf, normalise, parseSince, tally } from "./shared.ts";
+import { bounds, createdAtOf, normalise, recentWindow, spanOf, tally } from "./shared.ts";
 import { cosine, type Embedder } from "./vectors.ts";
 
 type Row = Thought & { key: string; vector: number[]; seq: number };
@@ -19,14 +19,6 @@ function newId(seq: number): string {
   const t = Date.now().toString(36).padStart(9, "0");
   const r = crypto.getRandomValues(new Uint8Array(4));
   return `jf_${t}_${seq.toString(36)}_${[...r].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
-}
-
-function matches(meta: ThoughtMetadata, q: RecentQuery): boolean {
-  if (q.type !== undefined && meta.type !== q.type) return false;
-  if (q.topic !== undefined && !(Array.isArray(meta.topics) && meta.topics.includes(q.topic))) return false;
-  if (q.person !== undefined && !(Array.isArray(meta.people) && meta.people.includes(q.person))) return false;
-  if (q.sourcePrefix !== undefined && !(typeof meta.source === "string" && meta.source.startsWith(q.sourcePrefix))) return false;
-  return true;
 }
 
 export class JsonFileMemory implements Memory {
@@ -140,25 +132,14 @@ export class JsonFileMemory implements Memory {
   }
 
   async recent(scope: Scope, query: RecentQuery): Promise<Thought[]> {
-    const since = parseSince(query.since);
     const f = await this.load(scope);
-    return [...f.rows]
-      .sort((a, b) => b.seq - a.seq)
-      .filter((r) => matches(r.metadata, query))
-      .filter((r) => since === null || Date.parse(r.createdAt) >= since)
-      .slice(0, boundLimit(query.limit))
-      .map(strip);
+    return recentWindow(f.rows, query).map(strip);
   }
 
   async summary(scope: Scope): Promise<Summary> {
     const f = await this.load(scope);
-    const rows = [...f.rows].sort((a, b) => b.seq - a.seq);
-    const s: Summary = { count: rows.length, types: {}, topics: {}, people: {} };
-    if (rows.length) {
-      s.newest = rows[0].createdAt;
-      s.oldest = rows[rows.length - 1].createdAt;
-    }
-    for (const r of rows) tally(s, r.metadata);
+    const s: Summary = { count: f.rows.length, types: {}, topics: {}, people: {}, ...spanOf(f.rows.map((r) => r.createdAt)) };
+    for (const r of f.rows) tally(s, r.metadata);
     return s;
   }
 

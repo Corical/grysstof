@@ -5,7 +5,7 @@
  * by tenant, so it is also the reference multi-tenant implementation.
  */
 import type { Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, createdAtOf, normalise, parseSince, tally } from "./shared.ts";
+import { bounds, createdAtOf, normalise, recentWindow, spanOf, tally } from "./shared.ts";
 
 type Row = Thought & { key: string; words: Set<string>; seq: number };
 
@@ -20,14 +20,6 @@ function jaccard(a: Set<string>, b: Set<string>): number {
   return inter / (a.size + b.size - inter);
 }
 
-function matches(meta: ThoughtMetadata, q: RecentQuery): boolean {
-  if (q.type !== undefined && meta.type !== q.type) return false;
-  if (q.topic !== undefined && !(Array.isArray(meta.topics) && meta.topics.includes(q.topic))) return false;
-  if (q.person !== undefined && !(Array.isArray(meta.people) && meta.people.includes(q.person))) return false;
-  if (q.sourcePrefix !== undefined && !(typeof meta.source === "string" && meta.source.startsWith(q.sourcePrefix))) return false;
-  return true;
-}
-
 export class KeywordMemory implements Memory {
   readonly isolation = "tenant" as const;
   private brains = new Map<string, Map<string, Row>>();
@@ -40,10 +32,6 @@ export class KeywordMemory implements Memory {
       this.brains.set(scope.tenant, b);
     }
     return b;
-  }
-
-  private newestFirst(scope: Scope): Row[] {
-    return [...this.brain(scope).values()].sort((a, b) => b.seq - a.seq);
   }
 
   remember(scope: Scope, content: string, metadata: ThoughtMetadata): Promise<{ id: string; alreadyKnown: boolean }> {
@@ -88,28 +76,16 @@ export class KeywordMemory implements Memory {
   }
 
   recent(scope: Scope, query: RecentQuery): Promise<Thought[]> {
-    let since: number | null;
     try {
-      since = parseSince(query.since);
+      return Promise.resolve(recentWindow(this.brain(scope).values(), query).map(strip));
     } catch (e) {
       return Promise.reject(e);
     }
-    return Promise.resolve(
-      this.newestFirst(scope)
-        .filter((r) => matches(r.metadata, query))
-        .filter((r) => since === null || Date.parse(r.createdAt) >= since)
-        .slice(0, boundLimit(query.limit))
-        .map(strip),
-    );
   }
 
   summary(scope: Scope): Promise<Summary> {
-    const rows = this.newestFirst(scope);
-    const s: Summary = { count: rows.length, types: {}, topics: {}, people: {} };
-    if (rows.length) {
-      s.newest = rows[0].createdAt;
-      s.oldest = rows[rows.length - 1].createdAt;
-    }
+    const rows = [...this.brain(scope).values()];
+    const s: Summary = { count: rows.length, types: {}, topics: {}, people: {}, ...spanOf(rows.map((r) => r.createdAt)) };
     for (const r of rows) tally(s, r.metadata);
     return Promise.resolve(s);
   }

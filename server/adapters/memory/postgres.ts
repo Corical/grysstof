@@ -12,7 +12,7 @@
  */
 import { Pool } from "postgres";
 import type { Log, Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, createdAtOf, isUuid, normalise, parseSince, tally, fingerprint } from "./shared.ts";
+import { boundLimit, bounds, channelKey, createdAtOf, isUuid, normalise, parseSince, parseUntil, tally, fingerprint } from "./shared.ts";
 import { type Embedder, vectorLiteral } from "./vectors.ts";
 import { LATEST_SCHEMA, schemaVersion, vectorWidth } from "./postgres-migrate.ts";
 
@@ -185,9 +185,10 @@ export class PostgresMemory implements Memory {
   }
 
   recent(scope: Scope, q: RecentQuery): Promise<Thought[]> {
-    let since: number | null;
+    let since: number | null, until: number | null;
     try {
       since = parseSince(q.since);
+      until = parseUntil(q.until);
     } catch (e) {
       return Promise.reject(e);
     }
@@ -201,10 +202,24 @@ export class PostgresMemory implements Memory {
       params.push(q.sourcePrefix.replace(/[\\%_]/g, (c) => `\\${c}`) + "%");
       where.push(`metadata->>'source' LIKE $${params.length} ESCAPE '\\'`);
     }
+    if (q.channel !== undefined) {
+      // Same rule as channelKey(): a string, trimmed, one leading # dropped, any case. Equality, so no wildcard escaping is needed.
+      const want = channelKey(q.channel);
+      if (want === undefined) where.push("FALSE"); // a blank channel names nothing
+      else {
+        params.push(want);
+        where.push(`jsonb_typeof(metadata->'channel') = 'string'
+          AND lower(btrim(regexp_replace(btrim(metadata->>'channel'), '^#', ''))) = $${params.length}`);
+      }
+    }
     if (since !== null) { params.push(new Date(since).toISOString()); where.push(`created_at >= $${params.length}::timestamptz`); }
+    if (until !== null) { params.push(new Date(until).toISOString()); where.push(`created_at < $${params.length}::timestamptz`); }
+    const dir = q.order === "oldest" ? "ASC" : "DESC";
     params.push(boundLimit(q.limit));
+    const limitAt = params.length;
+    params.push(boundLimit(q.offset ?? 0));
     const sql = `SELECT id::text, content, metadata, created_at, updated_at FROM thoughts
-      WHERE ${where.join(" AND ")} ORDER BY created_at DESC, id DESC LIMIT $${params.length}`;
+      WHERE ${where.join(" AND ")} ORDER BY created_at ${dir}, id ${dir} LIMIT $${limitAt} OFFSET $${params.length}`;
     return this.run(async (c) => (await c.queryObject<DbRow>(sql, params)).rows.map(toThought));
   }
 

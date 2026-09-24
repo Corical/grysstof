@@ -43,7 +43,7 @@ if (!url) {
   Deno.test("[postgres] migrations: from zero to latest, then nothing to do; version and width readable", async () => {
     assertEquals(first.from, 0);
     assertEquals(first.to, LATEST_SCHEMA);
-    assertEquals(first.applied, ["0001_baseline", "0002_tenancy", "0003_fingerprint_from_caller", "0004_facts"]);
+    assertEquals(first.applied, ["0001_baseline", "0002_tenancy", "0003_fingerprint_from_caller", "0004_facts", "0005_fact_occurred_at"]);
     const again = await migrate(url, { dims: DIMS });
     assertEquals(again.applied, []);
     assertEquals(again.to, LATEST_SCHEMA);

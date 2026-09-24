@@ -197,6 +197,91 @@ export function runMemoryContract(name: string, make: MemoryFactory) {
     assertEquals((await m.recent(A, { limit: 0 })).length, 0);
   });
 
+  t("recent orders by when a thought happened, not when it was stored: history imported out of order reads in date order both ways", async (m) => {
+    const c = await m.remember(A, "Everything is showing now", { occurred_at: "2026-09-23T12:11:00Z" });
+    const a = await m.remember(A, "Schedules deleted and recreated", { occurred_at: "2026-09-22T09:36:00Z" });
+    const b = await m.remember(A, "Restored the deleted schedules for Paulos", { occurred_at: "2026-09-22T13:09:00Z" });
+    assertEquals((await m.recent(A, { limit: 10 })).map((t) => t.id), [c.id, b.id, a.id], "newest first by date");
+    assertEquals((await m.recent(A, { limit: 10, order: "oldest" })).map((t) => t.id), [a.id, b.id, c.id], "oldest first by date");
+    assertEquals((await m.recent(A, { limit: 2, order: "oldest" })).map((t) => t.id), [a.id, b.id], "limit keeps the OLDEST two, not the newest two reversed");
+    assertEquals((await m.recent(A, { limit: 1 })).map((t) => t.id), [c.id]);
+    assertEquals((await m.recent(A, { limit: 10, order: "newest" })).map((t) => t.id), [c.id, b.id, a.id], "explicit newest equals the default");
+  });
+
+  t("recent until: exclusive upper bound; since is inclusive; since == until and since > until are empty; a non-ISO until is an error", async (m) => {
+    const nine = await m.remember(A, "nine o'clock", { occurred_at: "2026-09-22T09:00:00Z" });
+    const ten = await m.remember(A, "ten o'clock", { occurred_at: "2026-09-22T10:00:00Z" });
+    await m.remember(A, "eleven o'clock", { occurred_at: "2026-09-22T11:00:00Z" });
+    assertEquals((await m.recent(A, { limit: 10, until: "2026-09-22T10:00:00Z" })).map((t) => t.id), [nine.id], "a thought AT until is excluded");
+    assertEquals((await m.recent(A, { limit: 10, since: "2026-09-22T10:00:00Z", until: "2026-09-22T11:00:00Z" })).map((t) => t.id), [ten.id], "a thought AT since is included");
+    assertEquals((await m.recent(A, { limit: 10, since: "2026-09-22T10:00:00Z", until: "2026-09-22T10:00:00Z" })).length, 0);
+    assertEquals((await m.recent(A, { limit: 10, since: "2026-09-22T11:00:00Z", until: "2026-09-22T09:00:00Z" })).length, 0, "an inverted window is empty, not an error");
+    assertEquals((await m.recent(A, { limit: 10, until: "2026-09-22T12:00:00+02:00" })).map((t) => t.id), [nine.id], "an offset is honoured: 12:00+02:00 is 10:00Z");
+    for (const bad of ["tomorrow", "", "2026-13-01", "22/09/2026"]) {
+      let threw = false;
+      try {
+        await m.recent(A, { limit: 10, until: bad });
+      } catch {
+        threw = true;
+      }
+      assert(threw, `until=${JSON.stringify(bad)} must throw`);
+    }
+  });
+
+  t("recent offset pages without gaps or repeats, even when many thoughts share one timestamp; bad offsets are bounded like limit", async (m) => {
+    const same = "2026-09-22T15:13:00Z";
+    const ids: string[] = [];
+    for (const w of ["alpha", "bravo", "charlie", "delta", "echo"]) ids.push((await m.remember(A, `burst ${w}`, { occurred_at: same })).id);
+    ids.push((await m.remember(A, "before the burst", { occurred_at: "2026-09-22T15:00:00Z" })).id);
+    ids.push((await m.remember(A, "after the burst", { occurred_at: "2026-09-22T16:00:00Z" })).id);
+    for (const order of ["newest", "oldest"] as const) {
+      const whole = (await m.recent(A, { limit: 100, order })).map((t) => t.id);
+      assertEquals(new Set(whole).size, whole.length, `${order}: no duplicates in one read`);
+      const paged: string[] = [];
+      for (let offset = 0; offset < 10; offset += 2) paged.push(...(await m.recent(A, { limit: 2, offset, order })).map((t) => t.id));
+      assertEquals(paged, whole, `${order}: pages of 2 concatenate to exactly the single read`);
+      assertEquals(new Set(paged).size, ids.length, `${order}: every thought appears once`);
+    }
+    const newest = (await m.recent(A, { limit: 100 })).map((t) => t.id);
+    assertEquals((await m.recent(A, { limit: 100, order: "oldest" })).map((t) => t.id), [...newest].reverse(), "oldest is exactly newest reversed, ties included");
+    assertEquals((await m.recent(A, { limit: 10, offset: 100 })).length, 0, "an offset past the end is empty");
+    assertEquals((await m.recent(A, { limit: 2, offset: -3 })).map((t) => t.id), newest.slice(0, 2), "a negative offset is 0");
+    assertEquals((await m.recent(A, { limit: 2, offset: NaN })).map((t) => t.id), newest.slice(0, 2), "NaN offset is 0");
+    assertEquals((await m.recent(A, { limit: 2, offset: 1.9 })).map((t) => t.id), newest.slice(1, 3), "a fractional offset rounds down");
+  });
+
+  t("recent channel: exact name, any case, optional #, never a prefix or a wildcard; thread messages belong to their channel; odd metadata never crashes", async (m) => {
+    const q1 = await m.remember(A, "Can we restore some schedules", { channel: "queries", occurred_at: "2026-09-22T13:09:00Z" });
+    const q2 = await m.remember(A, "Everything is showing now", { channel: "Queries", thread: "marlin schedules", occurred_at: "2026-09-23T12:11:00Z" });
+    await m.remember(A, "Old queries archive line", { channel: "queries-old" });
+    await m.remember(A, "Retail creative update", { channel: "retail_creative" });
+    await m.remember(A, "Lookalike channel", { channel: "retailXcreative" });
+    await m.remember(A, "Percent channel", { channel: "50%" });
+    await m.remember(A, "Numeric channel metadata", { channel: 42 });
+    await m.remember(A, "Array channel metadata", { channel: ["queries"] });
+    await m.remember(A, "No channel at all", {});
+    const ids = async (channel: string, extra: Record<string, unknown> = {}) => (await m.recent(A, { limit: 50, order: "oldest", channel, ...extra })).map((t) => t.id);
+    assertEquals(await ids("queries"), [q1.id, q2.id], "both cases, the thread line included, not queries-old, not the array");
+    assertEquals(await ids("#queries"), [q1.id, q2.id], "a leading # is ignored");
+    assertEquals(await ids("  QUERIES  "), [q1.id, q2.id], "case and outer spaces are ignored");
+    assertEquals(await ids("querie"), [], "a channel is not a prefix");
+    assertEquals((await ids("retail_creative")).length, 1, "_ is not a wildcard");
+    assertEquals((await ids("50%")).length, 1, "% is literal");
+    assertEquals(await ids("5%"), [], "% does not match anything else");
+    assertEquals(await ids("queries", { since: "2026-09-23T00:00:00Z" }), [q2.id], "combines with since");
+    assertEquals(await ids("queries", { until: "2026-09-23T00:00:00Z" }), [q1.id], "combines with until");
+    if (m.isolation === "tenant") assertEquals((await m.recent(B, { limit: 10, channel: "queries" })).length, 0, "never another tenant's");
+  });
+
+  t("summary oldest and newest are by date, not by storage order", async (m) => {
+    await m.remember(A, "stored first, happened last", { occurred_at: "2026-09-23T12:00:00Z" });
+    await m.remember(A, "stored second, happened first", { occurred_at: "2026-01-01T00:00:00Z" });
+    await m.remember(A, "stored last, happened in between", { occurred_at: "2026-05-01T00:00:00Z" });
+    const s = await m.summary(A);
+    assertEquals(s.oldest, "2026-01-01T00:00:00.000Z");
+    assertEquals(s.newest, "2026-09-23T12:00:00.000Z");
+  });
+
   t("summary of an empty memory", async (m) => {
     assertEquals(await m.summary(A), { count: 0, types: {}, topics: {}, people: {} });
   });

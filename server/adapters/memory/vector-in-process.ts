@@ -4,7 +4,7 @@
  * port as KeywordMemory. Single-tenant: ignores scope.
  */
 import type { Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, createdAtOf, normalise, parseSince, tally } from "./shared.ts";
+import { bounds, createdAtOf, normalise, recentWindow, spanOf, tally } from "./shared.ts";
 import { cosine, type Embedder } from "./vectors.ts";
 
 type Row = Thought & { key: string; vector: number[]; seq: number };
@@ -64,31 +64,16 @@ export class VectorMemory implements Memory {
   }
 
   recent(_scope: Scope, q: RecentQuery): Promise<Thought[]> {
-    let since: number | null;
     try {
-      since = parseSince(q.since);
+      return Promise.resolve(recentWindow(this.rows.values(), q).map(strip));
     } catch (e) {
       return Promise.reject(e);
     }
-    const out = [...this.rows.values()]
-      .sort((a, b) => b.seq - a.seq)
-      .filter((r) => q.type === undefined || r.metadata.type === q.type)
-      .filter((r) => q.topic === undefined || (Array.isArray(r.metadata.topics) && r.metadata.topics.includes(q.topic)))
-      .filter((r) => q.person === undefined || (Array.isArray(r.metadata.people) && r.metadata.people.includes(q.person)))
-      .filter((r) => q.sourcePrefix === undefined || (typeof r.metadata.source === "string" && r.metadata.source.startsWith(q.sourcePrefix)))
-      .filter((r) => since === null || Date.parse(r.createdAt) >= since)
-      .slice(0, boundLimit(q.limit))
-      .map(strip);
-    return Promise.resolve(out);
   }
 
   summary(_scope: Scope): Promise<Summary> {
-    const rows = [...this.rows.values()].sort((a, b) => b.seq - a.seq);
-    const s: Summary = { count: rows.length, types: {}, topics: {}, people: {} };
-    if (rows.length) {
-      s.newest = rows[0].createdAt;
-      s.oldest = rows[rows.length - 1].createdAt;
-    }
+    const rows = [...this.rows.values()];
+    const s: Summary = { count: rows.length, types: {}, topics: {}, people: {}, ...spanOf(rows.map((r) => r.createdAt)) };
     for (const r of rows) tally(s, r.metadata);
     return Promise.resolve(s);
   }

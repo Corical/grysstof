@@ -9,10 +9,10 @@
 /// <reference path="./node-sqlite.d.ts" />
 import { DatabaseSync } from "node:sqlite";
 import type { Memory, Recalled, RecentQuery, Scope, Summary, Thought, ThoughtMetadata } from "../../core/ports/mod.ts";
-import { boundLimit, bounds, createdAtOf, fingerprint, normalise, parseSince, tally } from "./shared.ts";
+import { bounds, createdAtOf, fingerprint, normalise, recentWindow, spanOf, tally } from "./shared.ts";
 import { cosine, type Embedder } from "./vectors.ts";
 
-type Row = { id: string; tenant: string; content: string; metadata: string; created_at: string; updated_at: string; fingerprint: string; embedding: Uint8Array | null };
+type Row = { id: string; tenant: string; content: string; metadata: string; created_at: string; updated_at: string; fingerprint: string; embedding: Uint8Array | null; seq: number };
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS thoughts (
@@ -36,14 +36,6 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 const toBlob = (v: number[]) => new Uint8Array(new Float32Array(v).buffer);
 const fromBlob = (b: Uint8Array) => Array.from(new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4));
 
-function matches(meta: ThoughtMetadata, q: RecentQuery): boolean {
-  if (q.type !== undefined && meta.type !== q.type) return false;
-  if (q.topic !== undefined && !(Array.isArray(meta.topics) && meta.topics.includes(q.topic))) return false;
-  if (q.person !== undefined && !(Array.isArray(meta.people) && meta.people.includes(q.person))) return false;
-  if (q.sourcePrefix !== undefined && !(typeof meta.source === "string" && meta.source.startsWith(q.sourcePrefix))) return false;
-  return true;
-}
-
 export class SqliteMemory implements Memory {
   readonly isolation = "tenant" as const;
   private readonly db: DatabaseSync;
@@ -53,6 +45,8 @@ export class SqliteMemory implements Memory {
   constructor(path: string, private readonly embedder: Embedder) {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL");
+    // A second process on the same file (a backfill, a seeder) waits for the lock instead of failing at once.
+    this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec(SCHEMA);
     const model = this.db.prepare("SELECT v FROM meta WHERE k = 'embedding'").get() as { v: string } | undefined;
     const want = `${embedder.model}/${embedder.dimensions}`;
@@ -119,28 +113,18 @@ export class SqliteMemory implements Memory {
   }
 
   recent(scope: Scope, query: RecentQuery): Promise<Thought[]> {
-    let since: number | null;
     try {
-      since = parseSince(query.since);
+      const rows = this.db.prepare("SELECT * FROM thoughts WHERE tenant = ?").all(scope.tenant) as Row[];
+      const held = rows.map((r) => ({ ...toThought(r), seq: r.seq }));
+      return Promise.resolve(recentWindow(held, query).map(({ seq: _seq, ...t }) => t));
     } catch (e) {
       return Promise.reject(e);
     }
-    const rows = this.db.prepare("SELECT * FROM thoughts WHERE tenant = ? ORDER BY seq DESC").all(scope.tenant) as Row[];
-    return Promise.resolve(
-      rows.map(toThought)
-        .filter((t) => matches(t.metadata, query))
-        .filter((t) => since === null || Date.parse(t.createdAt) >= since)
-        .slice(0, boundLimit(query.limit)),
-    );
   }
 
   summary(scope: Scope): Promise<Summary> {
-    const rows = this.db.prepare("SELECT metadata, created_at FROM thoughts WHERE tenant = ? ORDER BY seq DESC").all(scope.tenant) as { metadata: string; created_at: string }[];
-    const s: Summary = { count: rows.length, types: {}, topics: {}, people: {} };
-    if (rows.length) {
-      s.newest = rows[0].created_at;
-      s.oldest = rows[rows.length - 1].created_at;
-    }
+    const rows = this.db.prepare("SELECT metadata, created_at FROM thoughts WHERE tenant = ?").all(scope.tenant) as { metadata: string; created_at: string }[];
+    const s: Summary = { count: rows.length, types: {}, topics: {}, people: {}, ...spanOf(rows.map((r) => r.created_at)) };
     for (const r of rows) tally(s, JSON.parse(r.metadata));
     return Promise.resolve(s);
   }
