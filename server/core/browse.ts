@@ -3,6 +3,7 @@
  * the page in browse-page.ts. Gate already passed; the scope is trusted.
  */
 import type { Ports, RecentQuery, Scope } from "./ports/mod.ts";
+import { wholeDayUntil } from "./when.ts";
 
 const PREFIX = "/browse/api";
 
@@ -34,9 +35,21 @@ const ROUTES = new Map<string, Route>(Object.entries({
   }),
   "/thoughts": async (q, { memory }, scope) => {
     const query: RecentQuery = { limit: limitOf(q, 200, 2000) };
-    for (const key of ["type", "topic", "person", "since"] as const) {
+    for (const key of ["type", "topic", "person", "since", "channel"] as const) {
       const v = param(q, key);
       if (v !== undefined) query[key] = v;
+    }
+    const until = wholeDayUntil(param(q, "until"));
+    if (until !== undefined) query.until = until;
+    const source = param(q, "source_prefix");
+    if (source !== undefined) query.sourcePrefix = source;
+    const order = param(q, "order");
+    if (order !== undefined && order !== "newest" && order !== "oldest") throw new Error(`order must be "newest" or "oldest", got "${order}"`);
+    if (order !== undefined) query.order = order;
+    const offset = param(q, "offset");
+    if (offset !== undefined) {
+      if (!/^\d+$/.test(offset)) throw new Error(`offset must be a whole number ≥ 0, got "${offset}"`);
+      query.offset = Number(offset);
     }
     return { thoughts: await memory.recent(scope, query) };
   },

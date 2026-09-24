@@ -11,6 +11,7 @@ import type { CoreOptions, Fact, Ports, Scope } from "./ports/mod.ts";
 import { capture } from "./capture.ts";
 import { BROWSE_PAGE } from "./browse-page.ts";
 import { browseApi } from "./browse.ts";
+import { wholeDayUntil } from "./when.ts";
 
 /**
  * ISO 8601 date (YYYY-MM-DD): unambiguous in every locale, sorts as text.
@@ -125,7 +126,9 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
     {
       title: "Search Thoughts",
       description:
-        "Search captured thoughts by meaning. Use this when the user asks about a topic, person, or idea they've previously captured.",
+        "Search captured thoughts by meaning. Use this when the user asks about a topic, person, or idea they've previously captured. " +
+        "Each result is one message on its own: before concluding what happened (was it resolved, what was decided), read the conversation " +
+        "around the best results with list_thoughts, using the channel and time each result shows.",
       annotations: { readOnlyHint: true },
       inputSchema: {
         query: z.string().describe("What to search for"),
@@ -146,6 +149,8 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
             `Captured: ${day(t.createdAt)}`,
             `Type: ${oneLine(m.type || "unknown")}`,
           ];
+          if (typeof m.channel === "string") parts.push(`Where: #${oneLine(m.channel)}${typeof m.thread === "string" ? ` > ${oneLine(m.thread)}` : ""} at ${t.createdAt}`);
+          if (typeof m.source === "string") parts.push(`Source: ${oneLine(m.source)}`);
           if (topics.length) parts.push(`Topics: ${topics.join(", ")}`);
           if (people.length) parts.push(`People: ${people.join(", ")}`);
           if (actions.length) parts.push(`Actions: ${actions.join("; ")}`);
@@ -165,20 +170,30 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
     "list_thoughts",
     {
       title: "List Recent Thoughts",
-      description: "List recently captured thoughts with optional filters by type, topic, person, or time range.",
+      description:
+        "List captured thoughts in date order with filters by channel, time window, type, topic, person or source. " +
+        "Use it to read a conversation: after search_thoughts finds a message, call this with that message's channel and a since/until window " +
+        "around it, order \"oldest\", to see what was said before and after — for example whether an issue was later resolved. " +
+        "When more thoughts match than were returned, the reply ends with the offset to continue from.",
       annotations: { readOnlyHint: true },
       inputSchema: {
         limit: z.number().int().min(1).max(100).optional().default(10),
         type: z.string().optional().describe("Filter by type: observation, task, idea, reference, person_note"),
         topic: z.string().optional().describe("Filter by topic tag"),
         person: z.string().optional().describe("Filter by person mentioned"),
+        channel: z.string().max(100).optional().describe("Only this channel, by name: \"queries\" or \"#queries\", any case. Thread messages count as their channel's."),
         days: z.number().int().min(1).optional().describe("Only thoughts from the last N days"),
-        since: z.string().max(40).optional().describe("Only thoughts dated at or after this ISO 8601 instant; overrides days"),
+        since: z.string().max(40).optional().describe("Only thoughts dated at or after this ISO 8601 instant (a date alone is the start of that day, UTC); overrides days"),
+        until: z.string().max(40).optional().describe(
+          "Only thoughts dated before this ISO 8601 instant. A date alone (2026-09-23) includes that whole day, UTC. For local days give an offset, e.g. 2026-09-24T00:00:00+02:00.",
+        ),
+        order: z.enum(["newest", "oldest"]).optional().default("newest").describe("\"oldest\" reads a conversation top to bottom"),
+        offset: z.number().int().min(0).optional().default(0).describe("Skip this many matches, to continue where a previous reply stopped"),
         source_prefix: z.string().max(300).optional().describe("Only thoughts whose source starts with this, e.g. \"discord:<guild>/<channel>/\" for one channel"),
-        verbose: z.boolean().optional().default(false).describe("Also print each thought's id, exact time and source"),
+        verbose: z.boolean().optional().default(false).describe("Also print each thought's id, exact time, source, channel and what it replies to"),
       },
     },
-    async ({ limit, type, topic, person, days, since: sinceArg, source_prefix, verbose }) => {
+    async ({ limit, type, topic, person, channel, days, since: sinceArg, until: untilArg, order, offset, source_prefix, verbose }) => {
       try {
         called("list_thoughts");
         let since: string | undefined = sinceArg;
@@ -187,16 +202,28 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
           d.setDate(d.getDate() - days);
           since = d.toISOString();
         }
-        const found = await memory.recent(scope, { limit, type, topic, person, since, sourcePrefix: source_prefix });
-        if (!found.length) return text("No thoughts found.");
+        const until = wholeDayUntil(untilArg);
+        // One extra row says whether more exist, so a reply is never silently cut short.
+        const got = await memory.recent(scope, { limit: limit + 1, type, topic, person, channel, since, until, order, offset, sourcePrefix: source_prefix });
+        const found = got.slice(0, limit);
+        if (!found.length) return text(offset > 0 ? `No thoughts found past offset ${offset}.` : "No thoughts found.");
         const results = found.map((t, i) => {
           const m = t.metadata || {};
           const tags = list(m.topics).join(", ");
-          const head = `${i + 1}. [${day(t.createdAt)}] (${oneLine(m.type || "??")}${tags ? " - " + tags : ""})`;
-          const detail = verbose ? `\n   id: ${oneLine(t.id)} · at: ${t.createdAt} · source: ${oneLine(String(m.source ?? ""))}${m.proof ? ` · proof: ${oneLine(String(m.proof))}` : ""}` : "";
+          const head = `${offset + i + 1}. [${day(t.createdAt)}] (${oneLine(m.type || "??")}${tags ? " - " + tags : ""})`;
+          const where = [
+            typeof m.channel === "string" ? ` · channel: #${oneLine(m.channel)}` : "",
+            typeof m.thread === "string" ? ` · thread: ${oneLine(m.thread)}` : "",
+            typeof m.in_reply_to === "string" ? ` · replies to: ${oneLine(m.in_reply_to)}` : "",
+          ].join("");
+          const detail = verbose
+            ? `\n   id: ${oneLine(t.id)} · at: ${t.createdAt} · source: ${oneLine(String(m.source ?? ""))}${m.proof ? ` · proof: ${oneLine(String(m.proof))}` : ""}${where}`
+            : "";
           return `${head}${detail}\n${quote(t.content)}`;
         });
-        return text(`${found.length} recent thought(s):\n\n${results.join("\n\n")}`);
+        const more = got.length > limit ? `\n\nMore thoughts match. Call again with offset=${offset + limit} to continue.` : "";
+        const header = `${found.length} ${order === "oldest" ? "thought(s), oldest first" : "recent thought(s)"}:`;
+        return text(`${header}\n\n${results.join("\n\n")}${more}`);
       } catch (err) {
         log.error("tool.list_thoughts.failed", { tenant: scope.tenant, actor: scope.actor }, err);
         return failure(`Error: ${message(err)}`);
@@ -267,12 +294,23 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
         occurred_at: z.string().max(40).optional().describe(
           "When this actually happened, ISO 8601, for importing history. The thought is dated to it instead of to now.",
         ),
+        channel: z.string().max(100).optional().describe(
+          "The channel it was said in, by name without # (e.g. \"queries\"), so list_thoughts can read the conversation back in order.",
+        ),
+        thread: z.string().max(200).optional().describe("The thread within that channel, by name, when it was said in one."),
+        in_reply_to: z.string().max(300).optional().describe(
+          "The source of the message this one replies to (e.g. \"discord:<guild>/<channel>/<message>\"), linking an answer to its question.",
+        ),
       },
     },
-    async ({ content, source, subject, proof, occurred_at }) => {
+    async ({ content, source, subject, proof, occurred_at, channel, thread, in_reply_to }) => {
       try {
         called("capture_thought");
-        const done = await capture(ports, scope, { content, source, subject, proof, occurredAt: occurred_at });
+        const where: Record<string, string> = {};
+        if (channel?.trim()) where.channel = channel.trim().replace(/^#/, "").trim();
+        if (thread?.trim()) where.thread = thread.trim();
+        if (in_reply_to?.trim()) where.in_reply_to = in_reply_to.trim();
+        const done = await capture(ports, scope, { content, source, subject, proof, occurredAt: occurred_at, metadata: where });
         const { understood } = done;
         let confirmation = done.kind === "fact"
           ? `Recorded fact ${done.id} about ${done.fact.subject} (from ${done.fact.source}, by ${done.fact.learnedBy}, unconfirmed)`

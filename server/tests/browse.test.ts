@@ -252,3 +252,23 @@ Deno.test("every API response is JSON with the CORS origin, whatever the outcome
     assertEquals(r.headers.get("access-control-allow-origin"), "*", `${method} ${path}`);
   }
 });
+
+Deno.test("/thoughts reads one channel's window in order with the same filters as list_thoughts; bad order, offset or until is a 400, never an empty list", async () => {
+  const app = keyed();
+  const lines = [
+    { content: "restore a subset first", channel: "queries", occurred_at: "2026-09-22T13:09:00Z", source: "discord:g/1/1" },
+    { content: "everything is showing now", channel: "Queries", occurred_at: "2026-09-23T12:11:00Z", source: "discord:g/1/2" },
+    { content: "tags not scanning", channel: "marlin", occurred_at: "2026-09-22T10:00:00Z", source: "discord:g/2/1" },
+    { content: "the day after", channel: "queries", occurred_at: "2026-09-24T08:00:00Z", source: "discord:g/1/3" },
+  ];
+  for (const l of lines) await call(app, "capture_thought", l, KEY);
+  const contents = (r: { body: { thoughts: { content: string }[] } }) => r.body.thoughts.map((t) => t.content);
+  assertEquals(contents(await get(app, "/browse/api/thoughts?channel=%23queries&until=2026-09-23&order=oldest", KEY)), ["restore a subset first", "everything is showing now"]);
+  assertEquals(contents(await get(app, "/browse/api/thoughts?channel=queries&order=oldest&offset=1&limit=1", KEY)), ["everything is showing now"]);
+  assertEquals(contents(await get(app, "/browse/api/thoughts?source_prefix=discord:g/2/", KEY)), ["tags not scanning"]);
+  for (const bad of ["order=sideways", "offset=-1", "offset=1.5", "offset=abc", "until=tomorrow"]) {
+    const r = await get(app, `/browse/api/thoughts?${bad}`, KEY);
+    assertEquals(r.status, 400, bad);
+    assert(typeof r.body.error === "string" && r.body.error.length > 0, bad);
+  }
+});

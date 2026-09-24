@@ -6,6 +6,7 @@
 import { assert, assertEquals, assertStringIncludes } from "@std/assert";
 import type { Hono } from "hono";
 import { buildApp } from "../core/app.ts";
+import { wholeDayUntil } from "../core/when.ts";
 import type { CoreOptions, Memory, Ports, Understanding } from "../core/ports/mod.ts";
 import { KeywordMemory } from "../adapters/memory/keyword.ts";
 import { VectorMemory } from "../adapters/memory/vector-in-process.ts";
@@ -45,7 +46,7 @@ Deno.test("initialize and tools/list expose the six upstream tools plus the ledg
   const list = await rpc(app, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
   assertEquals(list.body.result.tools.map((t: { name: string }) => t.name).sort(), [...UPSTREAM_TOOLS, ...LEDGER_TOOLS].sort());
   const capture = list.body.result.tools.find((t: { name: string }) => t.name === "capture_thought");
-  assertEquals(Object.keys(capture.inputSchema.properties).sort(), ["content", "occurred_at", "proof", "source", "subject"]);
+  assertEquals(Object.keys(capture.inputSchema.properties).sort(), ["channel", "content", "in_reply_to", "occurred_at", "proof", "source", "subject", "thread"]);
   assertEquals(capture.inputSchema.required, ["content"]);
 });
 
@@ -77,6 +78,102 @@ Deno.test("list_thoughts: source_prefix narrows to one channel, since is an exac
   assert(/id: \S+/.test(later));
   const plain = (await call(app, 6, "list_thoughts", { source_prefix: "discord:g/111/", limit: 50 })).result.content[0].text;
   assert(!plain.includes("source:"), "verbose off prints no detail line");
+});
+
+/**
+ * The night of 25 Sep 2026: 105 #queries messages over 22-23 Sep, captured out of order, around other channels'
+ * chatter. The resolution ("everything is showing now") never says "Marlin". An agent must be able to read the
+ * whole thread in order, page past 100 without losing a line, and be told when it has not seen everything.
+ */
+async function marlinNight() {
+  const app = buildApp(ports(new KeywordMemory(), { log: new RecordingLog() }), OPTIONS);
+  const at = (i: number) => new Date(Date.parse("2026-09-22T09:00:00Z") + i * 15 * 60_000).toISOString(); // 105 lines ≈ 26 hours
+  const order = Array.from({ length: 105 }, (_, i) => i).sort((a, b) => ((a * 37) % 105) - ((b * 37) % 105)); // stored scrambled
+  let id = 1;
+  for (const i of order) {
+    const r = await call(app, id++, "capture_thought", {
+      content: i === 104 ? "Discord #queries (Xactco), 2026-09-23, Devon: Yes, everything is showing now." : `Discord #queries (Xactco), line ${String(i).padStart(3, "0")}`,
+      source: `discord:g/111/${1000 + i}`,
+      channel: i % 2 ? "#Queries " : "queries",
+      occurred_at: at(i),
+      ...(i === 104 ? { in_reply_to: "discord:g/111/1103" } : {}),
+    });
+    assertEquals(r.result.isError, undefined, JSON.stringify(r));
+  }
+  await call(app, id++, "capture_thought", { content: "Marlin: tags not scanning in the app", source: "discord:g/222/1", channel: "marlin", occurred_at: "2026-09-22T10:00:00Z" });
+  await call(app, id++, "capture_thought", { content: "Standup: Marlin labs debugging", source: "discord:g/333/1", channel: "standup", occurred_at: "2026-09-23T10:00:00Z" });
+  await call(app, id++, "capture_thought", { content: "Queries line from the day after", source: "discord:g/111/9999", channel: "queries", occurred_at: "2026-09-24T08:00:00Z" });
+  return { app, at, next: () => id++ };
+}
+
+Deno.test("list_thoughts reads a whole channel thread in date order across pages, says when more exist, and never mixes channels", async () => {
+  const { app, next } = await marlinNight();
+  const args = { channel: "#queries", since: "2026-09-22", until: "2026-09-23", order: "oldest", limit: 100 };
+  const page1 = (await call(app, next(), "list_thoughts", args)).result.content[0].text as string;
+  assertStringIncludes(page1, "100 thought(s), oldest first:");
+  assertStringIncludes(page1, "More thoughts match. Call again with offset=100 to continue.");
+  const page2 = (await call(app, next(), "list_thoughts", { ...args, offset: 100 })).result.content[0].text as string;
+  assertStringIncludes(page2, "5 thought(s), oldest first:");
+  assert(!page2.includes("More thoughts match"), "the last page must not claim more");
+  assertStringIncludes(page2, "105. [2026-09-23]", "numbering continues across pages");
+  const lines = (t: string) => [...t.matchAll(/line (\d{3})|everything is showing now/g)].map((m) => m[1] ?? "104");
+  const read = [...lines(page1), ...lines(page2)];
+  assertEquals(read, Array.from({ length: 105 }, (_, i) => String(i).padStart(3, "0")).map((s) => (s === "104" ? "104" : s)), "every line once, in date order, although stored scrambled");
+  for (const other of ["tags not scanning", "Marlin labs debugging", "day after"]) {
+    assert(!page1.includes(other) && !page2.includes(other), `${other} leaked into the #queries window`);
+  }
+});
+
+Deno.test("list_thoughts until: a bare date includes that whole day; an instant is exclusive; garbage is an error, never an empty list", async () => {
+  const { app, at, next } = await marlinNight();
+  const firstDay = (await call(app, next(), "list_thoughts", { channel: "queries", until: "2026-09-22", limit: 100, order: "oldest" })).result.content[0].text as string;
+  const expected = Array.from({ length: 105 }, (_, i) => i).filter((i) => at(i) < "2026-09-23T00:00:00.000Z").length;
+  assertStringIncludes(firstDay, `${expected} thought(s), oldest first:`);
+  assert(firstDay.includes("line 059"), "23:45 on the 22nd is inside until=2026-09-22");
+  const exclusive = (await call(app, next(), "list_thoughts", { channel: "queries", until: at(3), limit: 100, order: "oldest" })).result.content[0].text as string;
+  assertStringIncludes(exclusive, "3 thought(s), oldest first:", "an instant excludes the thought exactly at it");
+  for (const bad of ["tomorrow", "22/09/2026", "2026-13-01"]) {
+    const r = await call(app, next(), "list_thoughts", { channel: "queries", until: bad });
+    assertEquals(r.result.isError, true, `until=${bad} must be an error: ${JSON.stringify(r.result)}`);
+    assertStringIncludes(r.result.content[0].text, "until must be an ISO 8601 timestamp");
+  }
+  const past = (await call(app, next(), "list_thoughts", { channel: "queries", offset: 500 })).result.content[0].text as string;
+  assertEquals(past, "No thoughts found past offset 500.");
+  const none = (await call(app, next(), "list_thoughts", { channel: "querie" })).result.content[0].text as string;
+  assertEquals(none, "No thoughts found.", "a channel is a name, not a prefix");
+});
+
+Deno.test("search_thoughts shows where and when each hit was said; verbose list_thoughts shows the channel and the message it replies to", async () => {
+  const { app, next } = await marlinNight();
+  const hit = (await call(app, next(), "search_thoughts", { query: "everything is showing now", threshold: 0, limit: 1 })).result.content[0].text as string;
+  assertStringIncludes(hit, "Where: #queries at 2026-09-23T11:00:00.000Z");
+  assertStringIncludes(hit, "Source: discord:g/111/1104");
+  const v = (await call(app, next(), "list_thoughts", { channel: "queries", since: "2026-09-23T11:00:00Z", until: "2026-09-23T11:00:01Z", verbose: true })).result.content[0].text as string;
+  assertStringIncludes(v, "channel: #queries");
+  assertStringIncludes(v, "replies to: discord:g/111/1103");
+  const parent = (await call(app, next(), "list_thoughts", { source_prefix: "discord:g/111/1103", limit: 5 })).result.content[0].text as string;
+  assertStringIncludes(parent, "line 103", "the reply's in_reply_to finds the message it answers");
+});
+
+Deno.test("capture_thought: channel is stored bare (no #, no outer spaces); blank channel, thread and in_reply_to are not stored", async () => {
+  const memory = new KeywordMemory();
+  const app = buildApp(ports(memory), OPTIONS);
+  await call(app, 1, "capture_thought", { content: "with a messy channel", channel: "  #Queries  ", thread: " marlin ", in_reply_to: " discord:g/1/2 " });
+  await call(app, 2, "capture_thought", { content: "with blanks", channel: "   ", thread: "", in_reply_to: "  " });
+  const [blank, messy] = await memory.recent({ tenant: "alice", actor: "alice" }, { limit: 10 });
+  assertEquals([messy.metadata.channel, messy.metadata.thread, messy.metadata.in_reply_to], ["Queries", "marlin", "discord:g/1/2"]);
+  assert(!("channel" in blank.metadata) && !("thread" in blank.metadata) && !("in_reply_to" in blank.metadata), JSON.stringify(blank.metadata));
+});
+
+Deno.test("wholeDayUntil: a bare date is the start of the next day UTC, across month and year ends; everything else passes through untouched", () => {
+  assertEquals(wholeDayUntil("2026-09-23"), "2026-09-24T00:00:00.000Z");
+  assertEquals(wholeDayUntil("2026-09-30"), "2026-10-01T00:00:00.000Z");
+  assertEquals(wholeDayUntil("2026-12-31"), "2027-01-01T00:00:00.000Z");
+  assertEquals(wholeDayUntil("2028-02-28"), "2028-02-29T00:00:00.000Z", "leap year");
+  assertEquals(wholeDayUntil("2026-02-29"), "2026-02-29", "not a real day: left for the memory to reject");
+  assertEquals(wholeDayUntil("2026-09-23T10:00:00Z"), "2026-09-23T10:00:00Z");
+  assertEquals(wholeDayUntil("tomorrow"), "tomorrow");
+  assertEquals(wholeDayUntil(undefined), undefined);
 });
 
 Deno.test("capture_thought with a subject and occurred_at dates the ledger line; fact_history shows Occurred and orders by it", async () => {
