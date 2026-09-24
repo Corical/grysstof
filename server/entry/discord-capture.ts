@@ -114,7 +114,23 @@ async function post(c: Capture): Promise<string> {
   const res = await fetch(brainUrl, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "x-brain-key": key!, "x-brain-actor": c.actor },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "capture_thought", arguments: { content: c.content, source: c.source, proof: c.proof, occurred_at: c.occurredAt } } }),
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "capture_thought",
+        arguments: {
+          content: c.content,
+          source: c.source,
+          proof: c.proof,
+          occurred_at: c.occurredAt,
+          channel: c.channel,
+          ...(c.thread ? { thread: c.thread } : {}),
+          ...(c.inReplyTo ? { in_reply_to: c.inReplyTo } : {}),
+        },
+      },
+    }),
   });
   if (!res.ok) throw new Error(`brain answered ${res.status}`);
   return textOf(await res.text());

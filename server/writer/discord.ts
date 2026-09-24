@@ -21,6 +21,8 @@ export type DiscordMessage = {
   mentions?: DiscordAuthor[];
   timestamp: string;
   referenced_message?: { author?: DiscordAuthor; content?: string } | null;
+  /** Set on replies (and on forwards/crossposts, which are not answers); its ids may be absent when they equal the message's own. */
+  message_reference?: { message_id?: string; channel_id?: string; guild_id?: string } | null;
 };
 
 export type Names = { guild?: string; channel: string; parent?: string; channelNames?: (id: string) => string | undefined };
@@ -33,7 +35,19 @@ export function resolveMentions(text: string, mentions: DiscordAuthor[] | undefi
     .replace(/<#(\d+)>/g, (whole, id) => (channelNames?.(id) ? `#${channelNames(id)}` : whole));
 }
 
-export type Capture = { content: string; source: string; proof: string; actor: string; occurredAt: string };
+export type Capture = {
+  content: string;
+  source: string;
+  proof: string;
+  actor: string;
+  occurredAt: string;
+  /** The channel by name; for a thread, its parent channel, so the whole conversation reads back under one name. */
+  channel: string;
+  /** The thread's name, when the message was said in one. */
+  thread?: string;
+  /** For a reply: the source of the message it answers, in the same shape as `source`. */
+  inReplyTo?: string;
+};
 export type Distilled = { skip: string } | Capture;
 
 export type Watermarks = Record<string, string>;
@@ -68,12 +82,19 @@ export function distil(m: DiscordMessage, names: Names): Distilled {
   const content = cut(`Discord ${where}${server}, ${day}, ${who}:${quoted} ${body}`, MAX_CONTENT);
 
   const guild = m.guild_id ?? "@me";
+  const ref = m.message_reference;
+  const inReplyTo = m.type === 19 && ref?.message_id
+    ? `discord:${ref.guild_id ?? guild}/${ref.channel_id ?? m.channel_id}/${ref.message_id}`
+    : undefined;
   return {
     content,
     source: `discord:${guild}/${m.channel_id}/${m.id}`,
     proof: `https://discord.com/channels/${guild}/${m.channel_id}/${m.id}`,
     actor: `discord:${m.author.username}`,
     occurredAt: m.timestamp,
+    channel: names.parent ?? names.channel,
+    ...(names.parent ? { thread: names.channel } : {}),
+    ...(inReplyTo ? { inReplyTo } : {}),
   };
 }
 

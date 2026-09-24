@@ -41,6 +41,32 @@ Deno.test("distil: replies quote the parent, threads name their parent channel, 
   assertEquals(dm.proof, "https://discord.com/channels/@me/1418000000000000001/1419000000000000002");
 });
 
+Deno.test("distil: carries the channel by name, the thread when in one, and what a reply answers, so a conversation can be read back", () => {
+  const plain = distil(base, names);
+  assert(!("skip" in plain));
+  assertEquals([plain.channel, plain.thread, plain.inReplyTo], ["reporting", undefined, undefined]);
+
+  const inThread = distil(base, { guild: "Xactco", channel: "hold decision", parent: "reporting" });
+  assert(!("skip" in inThread));
+  assertEquals([inThread.channel, inThread.thread], ["reporting", "hold decision"], "a thread's line belongs to its parent channel");
+
+  const reply = distil({ ...base, type: 19, message_reference: { message_id: "1419000000000000001", channel_id: "1418000000000000001", guild_id: "1417000000000000000" } }, names);
+  assert(!("skip" in reply));
+  assertEquals(reply.inReplyTo, "discord:1417000000000000000/1418000000000000001/1419000000000000001", "same coordinates as the parent's own source");
+
+  const refNoIds = distil({ ...base, type: 19, message_reference: { message_id: "1419000000000000001" } }, names);
+  assert(!("skip" in refNoIds));
+  assertEquals(refNoIds.inReplyTo, "discord:1417000000000000000/1418000000000000001/1419000000000000001", "missing channel/guild on the reference fall back to the message's own");
+
+  const crossPost = distil({ ...base, type: 0, message_reference: { message_id: "5", channel_id: "6", guild_id: "7" } }, names);
+  assert(!("skip" in crossPost));
+  assertEquals(crossPost.inReplyTo, undefined, "only a REPLY (type 19) answers something; a forward or crosspost reference is not an answer");
+
+  const dm = distil({ ...base, guild_id: undefined, type: 19, message_reference: { message_id: "9" } }, { channel: "dm" });
+  assert(!("skip" in dm));
+  assertEquals(dm.inReplyTo, "discord:@me/1418000000000000001/9");
+});
+
 Deno.test("distil: a very long message is cut, whitespace collapsed, username used when no display name", () => {
   const long = distil({ ...base, content: "x".repeat(5000), author: { id: "7", username: "corne", global_name: null } }, names);
   assert(!("skip" in long));
