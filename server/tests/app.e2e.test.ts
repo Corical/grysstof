@@ -38,13 +38,14 @@ const ports = (memory: Memory, over: Partial<Ports> = {}): Ports => ({
 
 const UPSTREAM_TOOLS = ["capture_thought", "fetch", "list_thoughts", "search", "search_thoughts", "thought_stats"];
 const LEDGER_TOOLS = ["confirm_fact", "fact_history", "find_facts", "supersede_fact"];
+const WRITER_TOOLS = ["record_reactions"];
 
 Deno.test("initialize and tools/list expose the six upstream tools plus the ledger's four", async () => {
   const app = buildApp(ports(new KeywordMemory()), OPTIONS);
   const init = await rpc(app, { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
   assertEquals(init.body.result.serverInfo.name, "open-brain");
   const list = await rpc(app, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
-  assertEquals(list.body.result.tools.map((t: { name: string }) => t.name).sort(), [...UPSTREAM_TOOLS, ...LEDGER_TOOLS].sort());
+  assertEquals(list.body.result.tools.map((t: { name: string }) => t.name).sort(), [...UPSTREAM_TOOLS, ...LEDGER_TOOLS, ...WRITER_TOOLS].sort());
   const capture = list.body.result.tools.find((t: { name: string }) => t.name === "capture_thought");
   assertEquals(Object.keys(capture.inputSchema.properties).sort(), ["channel", "content", "in_reply_to", "occurred_at", "proof", "source", "subject", "thread"]);
   assertEquals(capture.inputSchema.required, ["content"]);
@@ -163,6 +164,53 @@ Deno.test("capture_thought: channel is stored bare (no #, no outer spaces); blan
   const [blank, messy] = await memory.recent({ tenant: "alice", actor: "alice" }, { limit: 10 });
   assertEquals([messy.metadata.channel, messy.metadata.thread, messy.metadata.in_reply_to], ["Queries", "marlin", "discord:g/1/2"]);
   assert(!("channel" in blank.metadata) && !("thread" in blank.metadata) && !("in_reply_to" in blank.metadata), JSON.stringify(blank.metadata));
+});
+
+Deno.test("record_reactions: sets who reacted on exactly one message, replaces rather than appends, shows in list and search, changes nothing else, never creates a thought", async () => {
+  const memory = new KeywordMemory();
+  const app = buildApp(ports(memory), OPTIONS);
+  const A = { tenant: "alice", actor: "alice" };
+  await call(app, 1, "capture_thought", { content: "Discord #marlin (Xactco), 2026-09-23, Charne: Confirmed for 11:30.", source: "discord:g/1/12", channel: "marlin" });
+  await call(app, 2, "capture_thought", { content: "Discord #marlin (Xactco), 2026-09-23, Charne: Meeting moved.", source: "discord:g/1/123", channel: "marlin" });
+  const before = (await memory.recent(A, { limit: 10 })).find((t) => t.metadata.source === "discord:g/1/12")!;
+
+  const ok = await call(app, 3, "record_reactions", { source: "discord:g/1/12", reactions: [{ emoji: "👍", count: 2, by: ["Kelli", "Devon"] }] });
+  assertEquals(ok.result.isError, undefined, JSON.stringify(ok.result));
+  assertStringIncludes(ok.result.content[0].text, "👍 by Kelli, Devon");
+  const after = (await memory.recent(A, { limit: 10 }));
+  assertEquals(after.length, 2, "no thought created");
+  const hit = after.find((t) => t.metadata.source === "discord:g/1/12")!;
+  const neighbour = after.find((t) => t.metadata.source === "discord:g/1/123")!;
+  assertEquals(hit.id, before.id);
+  assertEquals(hit.content, before.content);
+  assertEquals({ ...hit.metadata, reactions: undefined }, { ...before.metadata, reactions: undefined }, "only reactions changed");
+  assert(!("reactions" in neighbour.metadata), "a source that merely starts with the given one is not touched");
+
+  const listed = (await call(app, 4, "list_thoughts", { channel: "marlin", limit: 10 })).result.content[0].text as string;
+  assertStringIncludes(listed, "Reactions: 👍 by Kelli, Devon");
+  const found = (await call(app, 5, "search_thoughts", { query: "Confirmed for 11:30", threshold: 0, limit: 1 })).result.content[0].text as string;
+  assertStringIncludes(found, "Reactions: 👍 by Kelli, Devon");
+
+  await call(app, 6, "record_reactions", { source: "discord:g/1/12", reactions: [{ emoji: "✅", count: 1, by: [] }] });
+  const replaced = (await call(app, 7, "list_thoughts", { channel: "marlin", limit: 10 })).result.content[0].text as string;
+  assert(!replaced.includes("👍"), "the old 👍 is gone: the list is the current state, not a history");
+  assertStringIncludes(replaced, "Reactions: ✅ ×1");
+  await call(app, 8, "record_reactions", { source: "discord:g/1/12", reactions: [] });
+  assert(!((await call(app, 9, "list_thoughts", { channel: "marlin", limit: 10 })).result.content[0].text as string).includes("Reactions:"), "all reactions removed: no line");
+
+  const unknown = await call(app, 10, "record_reactions", { source: "discord:g/1/999", reactions: [{ emoji: "👍", count: 1, by: [] }] });
+  assertEquals(unknown.result.isError, true);
+  assertStringIncludes(unknown.result.content[0].text, "No thought with source discord:g/1/999");
+  for (const bad of [
+    { source: "discord:g/1/12", reactions: [{ emoji: "👍", count: -1, by: [] }] },
+    { source: "discord:g/1/12", reactions: [{ emoji: "x".repeat(65), count: 1, by: [] }] },
+    { source: "discord:g/1/12", reactions: [{ emoji: "👍", count: 1, by: Array(101).fill("n") }] },
+    { source: "", reactions: [] },
+  ]) {
+    const r = await call(app, 11, "record_reactions", bad);
+    assert(r.error || r.result?.isError, `must be refused: ${JSON.stringify(bad).slice(0, 80)}`);
+  }
+  assertEquals((await memory.recent(A, { limit: 10 })).length, 2, "still no thought created");
 });
 
 Deno.test("wholeDayUntil: a bare date is the start of the next day UTC, across month and year ends; everything else passes through untouched", () => {
@@ -456,7 +504,7 @@ Deno.test("the shared-key gate denies with a JSON-RPC -32001 envelope and allows
   assertEquals(denied.body.error.code, -32001);
   assertEquals(denied.body.id, 9);
   const allowed = await rpc(app, { jsonrpc: "2.0", id: 10, method: "tools/list", params: {} }, { "x-brain-key": "s3cret" });
-  assertEquals(allowed.body.result.tools.length, 10);
+  assertEquals(allowed.body.result.tools.length, UPSTREAM_TOOLS.length + LEDGER_TOOLS.length + WRITER_TOOLS.length);
   await call(app, 11, "capture_thought", { content: "keyed" }, { "x-brain-key": "s3cret" });
   assertEquals((await memory.summary({ tenant: "shared", actor: "shared-key" })).count, 1);
   assertEquals((await memory.summary({ tenant: "someone-else", actor: "x" })).count, 0);

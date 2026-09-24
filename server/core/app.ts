@@ -12,6 +12,7 @@ import { capture } from "./capture.ts";
 import { BROWSE_PAGE } from "./browse-page.ts";
 import { browseApi } from "./browse.ts";
 import { wholeDayUntil } from "./when.ts";
+import { describeReactions, reactionsIn } from "./reactions.ts";
 
 /**
  * ISO 8601 date (YYYY-MM-DD): unambiguous in every locale, sorts as text.
@@ -154,6 +155,8 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
           if (topics.length) parts.push(`Topics: ${topics.join(", ")}`);
           if (people.length) parts.push(`People: ${people.join(", ")}`);
           if (actions.length) parts.push(`Actions: ${actions.join("; ")}`);
+          const reacted = describeReactions(reactionsIn(m.reactions));
+          if (reacted) parts.push(`Reactions: ${reacted}`);
           parts.push(`\n${quote(t.content)}`);
           return parts.join("\n");
         });
@@ -219,7 +222,8 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
           const detail = verbose
             ? `\n   id: ${oneLine(t.id)} · at: ${t.createdAt} · source: ${oneLine(String(m.source ?? ""))}${m.proof ? ` · proof: ${oneLine(String(m.proof))}` : ""}${where}`
             : "";
-          return `${head}${detail}\n${quote(t.content)}`;
+          const reacted = describeReactions(reactionsIn(m.reactions));
+          return `${head}${detail}\n${quote(t.content)}${reacted ? `\n${INDENT}Reactions: ${reacted}` : ""}`;
         });
         const more = got.length > limit ? `\n\nMore thoughts match. Call again with offset=${offset + limit} to continue.` : "";
         const header = `${found.length} ${order === "oldest" ? "thought(s), oldest first" : "recent thought(s)"}:`;
@@ -322,6 +326,43 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
       } catch (err) {
         log.error("tool.capture_thought.failed", { tenant: scope.tenant, actor: scope.actor }, err);
         return failure(`Failed to capture: ${message(err)}`);
+      }
+    },
+  );
+
+  // A writer's verb: who reacted to a message it captured. Reactions are the current state, replaced whole.
+  server.registerTool(
+    "record_reactions",
+    {
+      title: "Record Reactions",
+      description:
+        "Set who reacted to a captured message and with what (e.g. 👍 by Kelli, Devon), so an acknowledgement is visible next to the message. " +
+        "Finds the message by its exact source and replaces its reactions with the list given; an empty list clears them. Never creates a thought.",
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: false, idempotentHint: true },
+      inputSchema: {
+        source: z.string().min(1).max(300).describe("The exact source of the message reacted to, e.g. \"discord:<guild>/<channel>/<message>\""),
+        reactions: z.array(z.object({
+          emoji: z.string().min(1).max(64).describe("The emoji itself, or :name: for a server's own"),
+          count: z.number().int().min(0).max(100_000).describe("How many people reacted with it"),
+          by: z.array(z.string().min(1).max(100)).max(100).describe("Who reacted, by display name, where known"),
+        })).max(50),
+      },
+    },
+    async ({ source, reactions }) => {
+      try {
+        called("record_reactions");
+        const candidates = await memory.recent(scope, { limit: 1000, sourcePrefix: source });
+        const target = candidates.find((t) => t.metadata.source === source);
+        if (!target) return failure(`No thought with source ${source}`);
+        const r = await memory.remember(scope, target.content, { reactions });
+        if (!r.alreadyKnown || r.id !== target.id) {
+          log.error("tool.record_reactions.diverged", { tenant: scope.tenant, actor: scope.actor, source, expected: target.id, got: r.id });
+          return failure(`Error: the reactions for ${source} landed on ${r.id}, not ${target.id}`);
+        }
+        return text(reactions.length ? `Recorded reactions on ${target.id}: ${describeReactions(reactions)}` : `Cleared reactions on ${target.id}`);
+      } catch (err) {
+        log.error("tool.record_reactions.failed", { tenant: scope.tenant, actor: scope.actor }, err);
+        return failure(`Error: ${message(err)}`);
       }
     },
   );

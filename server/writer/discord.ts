@@ -8,6 +8,9 @@
  * coordinates, proof is the deep link Discord itself resolves.
  */
 
+import type { Reaction } from "../core/reactions.ts";
+export { describeReactions, type Reaction } from "../core/reactions.ts";
+
 export type DiscordAuthor = { id: string; username: string; global_name?: string | null; bot?: boolean };
 export type DiscordAttachment = { filename: string; url: string };
 export type DiscordMessage = {
@@ -96,6 +99,32 @@ export function distil(m: DiscordMessage, names: Names): Distilled {
     ...(names.parent ? { thread: names.channel } : {}),
     ...(inReplyTo ? { inReplyTo } : {}),
   };
+}
+
+/** A reaction as Discord reports it on a message: which emoji, how many people. Who reacted is a separate lookup. */
+export type DiscordReaction = { count: number; emoji: { id?: string | null; name?: string | null } };
+
+
+/** The form Discord's reactions endpoint takes: the character for a standard emoji, name:id for a server's own. */
+export function emojiKey(e: DiscordReaction["emoji"]): string {
+  return e.id ? `${e.name ?? "_"}:${e.id}` : e.name ?? "";
+}
+
+/** A reader's label: the character itself, or :name: for a server's own emoji. */
+function emojiLabel(e: DiscordReaction["emoji"]): string {
+  return e.id ? `:${e.name ?? "emoji"}:` : e.name ?? "?";
+}
+
+/**
+ * Who reacted with what. `usersFor(emojiKey)` gives the people behind one emoji, or undefined
+ * when that was not looked up; the count still stands then, with no names. Bots are never people.
+ */
+export function reactionsOf(reactions: DiscordReaction[] | undefined, usersFor: (key: string) => DiscordAuthor[] | undefined): Reaction[] {
+  return (reactions ?? []).map((r) => ({
+    emoji: emojiLabel(r.emoji),
+    count: r.count,
+    by: (usersFor(emojiKey(r.emoji)) ?? []).filter((u) => !u.bot).map(displayName),
+  }));
 }
 
 /** Snowflakes are 64-bit and ordered; compare as BigInt, never as strings of unequal length. */

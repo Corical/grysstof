@@ -1,5 +1,5 @@
 import { assert, assertEquals } from "@std/assert";
-import { advance, type DiscordMessage, distil, newer } from "../writer/discord.ts";
+import { advance, describeReactions, type DiscordAuthor, type DiscordMessage, distil, emojiKey, newer, reactionsOf } from "../writer/discord.ts";
 
 const base: DiscordMessage = {
   id: "1419000000000000002",
@@ -65,6 +65,32 @@ Deno.test("distil: carries the channel by name, the thread when in one, and what
   const dm = distil({ ...base, guild_id: undefined, type: 19, message_reference: { message_id: "9" } }, { channel: "dm" });
   assert(!("skip" in dm));
   assertEquals(dm.inReplyTo, "discord:@me/1418000000000000001/9");
+});
+
+Deno.test("reactionsOf: who reacted with what, by display name; custom emoji readable; bots never count as people; none is empty", () => {
+  const kelli = { id: "1", username: "kellireynolds", global_name: "Kelli" };
+  const devon = { id: "2", username: "dman_devon", global_name: "Devon" };
+  const dyno = { id: "3", username: "Dyno", bot: true };
+  const users: Record<string, DiscordAuthor[]> = { "👍": [kelli, devon], "niceone:1034055625639997491": [devon, dyno] };
+  const got = reactionsOf(
+    [{ count: 2, emoji: { id: null, name: "👍" } }, { count: 2, emoji: { id: "1034055625639997491", name: "niceone" } }],
+    (key) => users[key],
+  );
+  assertEquals(got, [
+    { emoji: "👍", count: 2, by: ["Kelli", "Devon"] },
+    { emoji: ":niceone:", count: 2, by: ["Devon"] },
+  ]);
+  assertEquals(reactionsOf(undefined, () => undefined), []);
+  assertEquals(reactionsOf([], () => undefined), []);
+  assertEquals(reactionsOf([{ count: 3, emoji: { id: null, name: "✅" } }], () => undefined), [{ emoji: "✅", count: 3, by: [] }], "who is unknown: the count still stands");
+  assertEquals(emojiKey({ id: null, name: "👍" }), "👍");
+  assertEquals(emojiKey({ id: "1034055625639997491", name: "niceone" }), "niceone:1034055625639997491", "the form Discord's reactions endpoint takes");
+});
+
+Deno.test("describeReactions: one line a person reads as who acknowledged the message", () => {
+  assertEquals(describeReactions([{ emoji: "👍", count: 2, by: ["Kelli", "Devon"] }, { emoji: "✅", count: 1, by: [] }]), "👍 by Kelli, Devon; ✅ ×1");
+  assertEquals(describeReactions([{ emoji: "👍", count: 3, by: ["Kelli"] }]), "👍 by Kelli and 2 more");
+  assertEquals(describeReactions([]), "");
 });
 
 Deno.test("distil: a very long message is cut, whitespace collapsed, username used when no display name", () => {

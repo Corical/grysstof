@@ -16,10 +16,15 @@
  * backfilled from its watermark, so downtime loses nothing and nothing is
  * posted twice. A channel seen for the first time starts from now.
  */
-import { advance, type Capture, type DiscordMessage, distil, type Names, type Watermarks } from "../writer/discord.ts";
+import { advance, type Capture, type DiscordMessage, distil, type Names, type Reaction, type Watermarks } from "../writer/discord.ts";
+import { type ReactionIo, syncChannelReactions, syncMessageReactions } from "../writer/discord-reactions.ts";
 
 const API = "https://discord.com/api/v10";
-const INTENTS = (1 << 0) | (1 << 9) | (1 << 15); // GUILDS, GUILD_MESSAGES, MESSAGE_CONTENT
+const INTENTS = (1 << 0) | (1 << 9) | (1 << 10) | (1 << 15); // GUILDS, GUILD_MESSAGES, GUILD_MESSAGE_REACTIONS, MESSAGE_CONTENT
+/** After a reconnect, reactions on messages this recent are re-read: a 👍 given while the bot was down still lands. */
+const REACTION_CATCHUP_DAYS = 7;
+/** A burst of reactions on one message becomes one refresh this long after the last. */
+const REACTION_SETTLE_MS = 3000;
 const THREAD_TYPES = new Set([10, 11, 12]);
 const BACKFILL_PAGE = 100;
 
@@ -134,6 +139,58 @@ async function post(c: Capture): Promise<string> {
   });
   if (!res.ok) throw new Error(`brain answered ${res.status}`);
   return textOf(await res.text());
+}
+
+/** record_reactions through the brain. "No thought with source" is an answer (the message was never captured), not a failure. */
+async function postReactions(source: string, reactions: Reaction[]): Promise<string> {
+  const res = await fetch(brainUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "x-brain-key": key!, "x-brain-actor": "discord:reactions" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "record_reactions", arguments: { source, reactions } } }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok) throw new Error(`brain answered ${res.status}`);
+  try {
+    return textOf(await res.text());
+  } catch (e) {
+    const msg = (e as Error).message;
+    if (msg.startsWith("No thought with source")) return msg;
+    throw e;
+  }
+}
+
+const reactionIo: ReactionIo = { rest, post: postReactions };
+const settling = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** Refresh one message's reactions once they settle, in line behind any capture still queued for it. */
+function reactionChanged(d: { guild_id?: string; channel_id: string; message_id: string }) {
+  const k = `${d.channel_id}/${d.message_id}`;
+  clearTimeout(settling.get(k));
+  settling.set(k, setTimeout(() => {
+    settling.delete(k);
+    chain = chain.then(async () => {
+      try {
+        const outcome = await syncMessageReactions(reactionIo, d.guild_id ?? "@me", d.channel_id, d.message_id);
+        await log({ event: "reactions.synced", channel: d.channel_id, message: d.message_id, outcome });
+      } catch (e) {
+        await log({ event: "reactions.failed", channel: d.channel_id, message: d.message_id, error: String(e) });
+      }
+    });
+  }, REACTION_SETTLE_MS));
+}
+
+/** After a reconnect: re-read the last few days' reactions in every tracked channel. */
+async function reactionCatchUp() {
+  const since = snowflakeAt(new Date(Date.now() - REACTION_CATCHUP_DAYS * 86_400_000).toISOString());
+  for (const channelId of Object.keys(marks)) {
+    const guild = channels.get(channelId)?.guild ?? "@me";
+    try {
+      const done = await syncChannelReactions(reactionIo, guild, channelId, since);
+      if (done.withReactions) await log({ event: "reactions.caught_up", channel: channelId, ...done });
+    } catch (e) {
+      await log({ event: "reactions.catchup_failed", channel: channelId, error: String(e) });
+    }
+  }
 }
 
 let chain = Promise.resolve();
@@ -265,7 +322,7 @@ async function dispatch(t: string, d: unknown) {
       sessionId = r.session_id;
       resumeUrl = r.resume_gateway_url;
       await log({ event: "gateway.ready", bot: r.user.username, brain: brainUrl, watermarks: Object.keys(marks).length });
-      backfill();
+      backfill().then(reactionCatchUp);
       break;
     }
     case "RESUMED":
@@ -286,6 +343,12 @@ async function dispatch(t: string, d: unknown) {
       break;
     case "MESSAGE_CREATE":
       enqueue(d as DiscordMessage, "gateway");
+      break;
+    case "MESSAGE_REACTION_ADD":
+    case "MESSAGE_REACTION_REMOVE":
+    case "MESSAGE_REACTION_REMOVE_ALL":
+    case "MESSAGE_REACTION_REMOVE_EMOJI":
+      reactionChanged(d as { guild_id?: string; channel_id: string; message_id: string });
       break;
   }
 }
