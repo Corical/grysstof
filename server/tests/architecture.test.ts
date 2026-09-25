@@ -37,11 +37,12 @@ Deno.test("no file under core/ mentions the environment, the network, a host, or
   const stripComments = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
   for await (const f of walk(new URL("core/", serverDir))) {
     const src = stripComments(await Deno.readTextFile(f));
-    if (f.pathname.endsWith("/core/browse-page.ts")) {
-      // The browser page is an asset the core hands out, not code the core runs: it may hold
+    const page = ({ "/core/browse-page.ts": "BROWSE_PAGE", "/core/pulse-page.ts": "PULSE_PAGE" } as Record<string, string>)[f.pathname.slice(f.pathname.lastIndexOf("/core/"))];
+    if (page) {
+      // A browser page is an asset the core hands out, not code the core runs: it may hold
       // nothing but one string constant. Its fetch() calls execute in the visitor's browser.
       assertEquals(/\bimport\b|\bDeno\b|\bfunction\b|\bawait\b/.test(src.replace(/String\.raw`[\s\S]*`/, "")), false, `${f.pathname} is more than a string`);
-      assertEquals(/^export const BROWSE_PAGE = String\.raw`/m.test(src), true, `${f.pathname} must export BROWSE_PAGE as a String.raw literal`);
+      assertEquals(new RegExp(`^export const ${page} = String\\.raw\``, "m").test(src), true, `${f.pathname} must export ${page} as a String.raw literal`);
       continue;
     }
     for (const re of forbidden) assertEquals(re.test(src), false, `${f.pathname} matches ${re}`);

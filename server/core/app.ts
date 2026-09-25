@@ -10,6 +10,7 @@ import { z } from "zod";
 import type { CoreOptions, Fact, Ports, Scope } from "./ports/mod.ts";
 import { capture } from "./capture.ts";
 import { BROWSE_PAGE } from "./browse-page.ts";
+import { PULSE_PAGE } from "./pulse-page.ts";
 import { browseApi } from "./browse.ts";
 import { wholeDayUntil } from "./when.ts";
 import { describeReactions, reactionsIn } from "./reactions.ts";
@@ -566,6 +567,9 @@ export function buildApp(rawPorts: Ports, options: CoreOptions): Hono {
     // The page itself is public; everything it fetches goes through the gate.
     if (c.req.method === "GET" && (path === "/browse" || path === "/browse/")) {
       return stamp(new Response(BROWSE_PAGE, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders } }));
+    }
+    if (c.req.method === "GET" && (path === "/portal" || path === "/portal/")) {
+      return stamp(new Response(PULSE_PAGE, { status: 200, headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders } }));
     }
     try {
       const decision = await ports.gate.authorise(new Request(c.req.raw.url, { method: c.req.raw.method, headers: c.req.raw.headers }));

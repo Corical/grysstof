@@ -4,6 +4,7 @@
  */
 import type { Ports, RecentQuery, Scope } from "./ports/mod.ts";
 import { wholeDayUntil } from "./when.ts";
+import { clientCards, clientForChannel, type Conversation, conversations, exploreGraph, looseEnds, toMessages } from "./pulse.ts";
 
 const PREFIX = "/browse/api";
 
@@ -53,11 +54,85 @@ const ROUTES = new Map<string, Route>(Object.entries({
     }
     return { thoughts: await memory.recent(scope, query) };
   },
+  "/pulse/overview": async (_q, ports, scope) => {
+    const p = await pulseInputs(ports, scope);
+    const now = Date.now();
+    const clientOf = (ch: string) => clientForChannel(ch, p.clients, p.overrides);
+    const channels = [...new Set(p.messages.map((m) => m.channel))].sort();
+    const convs = conversations(p.messages, GAP_MINUTES);
+    const open = looseEnds(p.messages, { now, days: 30, gapMinutes: GAP_MINUTES });
+    return {
+      tenant: scope.tenant,
+      totals: { messages: p.messages.length, channels: channels.length, clients: p.clients.length, newest: p.messages.at(-1)?.at ?? null },
+      cards: clientCards(p.messages, p.clients, p.overrides, p.factCounts, now),
+      looseEndsTotal: open.length,
+      looseEnds: open.map((m) => ({ ...m, client: clientOf(m.channel).client })).slice(0, 300),
+      mapping: channels.map((ch) => ({ channel: ch, ...clientOf(ch), messages: p.messages.filter((m) => m.channel === ch).length })),
+      recent: convs.slice(-25).reverse().map((c) => summariseConversation(c, clientOf(c.channel).client)),
+    };
+  },
+  "/pulse/client": async (q, ports, scope) => {
+    const client = param(q, "client") ?? "";
+    const p = await pulseInputs(ports, scope);
+    if (!p.clients.includes(client)) throw new Error(`No client ${client}`);
+    const now = Date.now();
+    const mine = p.messages.filter((m) => clientForChannel(m.channel, p.clients, p.overrides).client === client);
+    const facts = await ports.ledger.history(scope, client);
+    return {
+      card: clientCards(p.messages, p.clients, p.overrides, p.factCounts, now).find((c) => c.client === client),
+      conversations: conversations(mine, GAP_MINUTES).slice(-30).reverse().map((c) => ({ ...summariseConversation(c, client), messages: c.messages })),
+      looseEnds: looseEnds(mine, { now, days: 60, gapMinutes: GAP_MINUTES }),
+      facts: facts.filter((f) => !f.supersededBy).slice(0, 60), // history() is newest first
+    };
+  },
+  "/pulse/explore": async (q, ports, scope) => {
+    const query = param(q, "q") ?? "";
+    if (!query.trim()) return { query, nodes: [], links: [] };
+    const p = await pulseInputs(ports, scope);
+    const known = new Set(p.messages.map((m) => m.id));
+    const hits = (await ports.memory.recall(scope, query, { limit: 40, minScore: 0.3 })).filter((h) => known.has(h.id)).slice(0, limitOf(q, 8, 20));
+    const graph = exploreGraph(hits.map((h) => h.id), p.messages, (ch) => clientForChannel(ch, p.clients, p.overrides).client, { gapMinutes: GAP_MINUTES, maxMessages: 140 });
+    return { query, hits: hits.map((h) => ({ id: h.id, score: h.score })), ...graph };
+  },
+  "/pulse/thread": async (q, ports, scope) => {
+    const source = param(q, "source") ?? "";
+    const p = await pulseInputs(ports, scope);
+    const conv = conversations(p.messages, GAP_MINUTES).find((c) => c.messages.some((m) => m.source === source));
+    if (!conv) throw new Error(`No conversation holds ${source}`);
+    return { ...summariseConversation(conv, clientForChannel(conv.channel, p.clients, p.overrides).client), messages: conv.messages };
+  },
   "/recall": async (q, { memory }, scope) => ({
     thoughts: await memory.recall(scope, q.get("q") ?? "", { limit: limitOf(q, 50, 500), minScore: 0 }),
   }),
   "/thought": async (q, { memory }, scope) => ({ thought: await memory.get(scope, q.get("id") ?? "") }),
 } satisfies Record<string, Route>));
+
+/** Talk in one channel that pauses longer than this is two conversations. */
+const GAP_MINUTES = 120;
+
+/** Everything Pulse computes from: the captured messages, the known clients, their fact counts, and channel overrides. */
+async function pulseInputs(ports: Ports, scope: Scope) {
+  const [thoughts, subjects] = await Promise.all([
+    ports.memory.recent(scope, { limit: 10_000_000, sourcePrefix: "discord:", order: "oldest" }),
+    ports.ledger.subjects(scope),
+  ]);
+  const clients = subjects.map((s) => s.subject).filter((s) => s.startsWith("client:")).sort();
+  const factCounts = Object.fromEntries(subjects.filter((s) => s.subject.startsWith("client:")).map((s) => [s.subject, s.current]));
+  const overrides: Record<string, string> = {};
+  for (const s of subjects.filter((x) => x.subject.startsWith("channel:"))) {
+    const f = await ports.ledger.latest(scope, s.subject);
+    if (f) overrides[s.subject.slice("channel:".length).replace(/^#/, "").toLowerCase()] = f.claim.trim();
+  }
+  return { messages: toMessages(thoughts), clients, factCounts, overrides };
+}
+
+function summariseConversation(c: Conversation, client: string | null) {
+  return {
+    id: c.id, channel: c.channel, client, start: c.start, end: c.end, size: c.messages.length, people: c.people,
+    opener: { author: c.opener.author, text: c.opener.text.slice(0, 280), source: c.opener.source },
+    last: { author: c.last.author, text: c.last.text.slice(0, 280), source: c.last.source, reactions: c.last.reactions },
+  };
+}
 
 const json = (body: unknown, status = 200, extra: Record<string, string> = {}): Response =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...extra } });

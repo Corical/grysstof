@@ -253,6 +253,30 @@ Deno.test("every API response is JSON with the CORS origin, whatever the outcome
   }
 });
 
+Deno.test("/pulse: gated, one card per client subject, channels mapped by name, facts newest first, unknown client is a 400, an empty search is an empty graph", async () => {
+  const app = keyed();
+  assertEquals((await get(app, "/browse/api/pulse/overview")).body.error?.code, -32001, "no key, no data");
+  await call(app, "capture_thought", { content: "Marlin go-live set for 1 August", subject: "client:marlin", occurred_at: "2026-07-03T08:00:00Z" }, KEY);
+  await call(app, "capture_thought", { content: "Marlin schedules restored", subject: "client:marlin", occurred_at: "2026-09-23T09:00:00Z" }, KEY);
+  await call(app, "capture_thought", { content: "Discord #marlin (Xactco), 2026-09-22, Devon: can you check the tags?", source: "discord:g/1/1", channel: "marlin", occurred_at: new Date(Date.now() - 3_600_000).toISOString() }, KEY);
+  await call(app, "capture_thought", { content: "Discord #standup (Xactco), 2026-09-22, Saxon: check ins", source: "discord:g/2/1", channel: "standup" }, KEY);
+  const o = (await get(app, "/browse/api/pulse/overview", KEY)).body;
+  assertEquals(o.cards.map((c: { client: string }) => c.client), ["client:marlin"]);
+  assertEquals(o.cards[0].looseEnds, 1);
+  assertEquals(o.looseEndsTotal, 1);
+  assertEquals(o.mapping.map((m: { channel: string; client: string | null }) => [m.channel, m.client]), [["marlin", "client:marlin"], ["standup", null]]);
+  const c = (await get(app, "/browse/api/pulse/client?client=client:marlin", KEY)).body;
+  assertEquals(c.facts.map((f: { claim: string }) => f.claim), ["Marlin schedules restored", "Marlin go-live set for 1 August"], "newest first");
+  assertEquals(c.conversations.length, 1);
+  assertEquals((await get(app, "/browse/api/pulse/client?client=client:nobody", KEY)).status, 400);
+  assertEquals((await get(app, "/browse/api/pulse/explore?q=", KEY)).body.nodes, []);
+  assertEquals((await get(app, "/browse/api/pulse/thread?source=discord:g/1/1", KEY)).body.size, 1);
+  assertEquals((await get(app, "/browse/api/pulse/thread?source=discord:g/9/9", KEY)).status, 400);
+  const page = await app.request("/portal");
+  assertEquals(page.status, 200);
+  assertStringIncludes(await page.text(), "Grysstof Pulse");
+});
+
 Deno.test("/thoughts reads one channel's window in order with the same filters as list_thoughts; bad order, offset or until is a 400, never an empty list", async () => {
   const app = keyed();
   const lines = [
