@@ -121,7 +121,7 @@ export const PULSE_PAGE = String.raw`<!doctype html>
   <section class="view" id="loose"></section>
   <section class="view full" id="explore">
     <div id="graph"><svg></svg><div class="hint" id="hint">Type in the box above: the matching messages appear as bubbles,<br>pulled together with the conversations around them, who said what, who reacted, and which client it was.</div>
-      <div class="legend"><span><i style="background:var(--accent)"></i>matching message</span><span><i style="background:hsl(150,62%,66%)"></i>other messages (colour = channel)</span><span><i style="background:var(--person)"></i>person</span><span><i style="background:var(--client)"></i>client</span><span style="color:var(--accent)">── reply</span><span style="color:var(--ok)">- - reacted</span></div>
+      <div class="legend"><span><i style="background:var(--accent)"></i>highlighted message</span><span><i style="background:hsl(150,62%,66%)"></i>other messages (colour = channel)</span><span><i style="background:var(--person)"></i>person</span><span><i style="background:var(--client)"></i>client</span><span style="color:var(--accent)">── reply</span><span style="color:var(--ok)">- - reacted</span></div>
     </div>
     <aside id="side"><div class="empty">Click a bubble to read its conversation.</div></aside>
   </section>
@@ -286,9 +286,13 @@ export const PULSE_PAGE = String.raw`<!doctype html>
     msg("loading thread…");
     api("/pulse/thread?source=" + encodeURIComponent(source)).then(function (d) {
       show("explore");
+      // The graph follows what was opened: this conversation's bubbles, not the last search's.
+      $("q").value = "";
+      $("hint").style.display = "none";
+      draw(d.graph);
       $("side").innerHTML = threadHtml(d, source);
       var hit = document.querySelector("#side .msgline.hit"); if (hit) hit.scrollIntoView({ block: "center" });
-      msg("");
+      msg("Conversation in #" + d.channel + (d.client ? " · " + nice(d.client) : "") + " · " + d.size + " message" + (d.size > 1 ? "s" : ""));
     }).catch(function (e) { msg(e.message); });
   }
 

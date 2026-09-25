@@ -270,7 +270,15 @@ Deno.test("/pulse: gated, one card per client subject, channels mapped by name, 
   assertEquals(c.conversations.length, 1);
   assertEquals((await get(app, "/browse/api/pulse/client?client=client:nobody", KEY)).status, 400);
   assertEquals((await get(app, "/browse/api/pulse/explore?q=", KEY)).body.nodes, []);
-  assertEquals((await get(app, "/browse/api/pulse/thread?source=discord:g/1/1", KEY)).body.size, 1);
+  const thread = (await get(app, "/browse/api/pulse/thread?source=discord:g/1/1", KEY)).body;
+  assertEquals(thread.size, 1);
+  const ids = thread.graph.nodes.map((n: { id: string }) => n.id);
+  assert(thread.graph.nodes.some((n: { source?: string; hit?: boolean }) => n.source === "discord:g/1/1" && n.hit), "the opened message is in its graph, marked");
+  assert(ids.includes("person:Devon") && ids.includes("client:marlin"), "with who said it and its client: the graph matches the thread, not the last search");
+  await call(app, "capture_thought", { content: "Discord #marlin (Xactco), 2026-09-20, Kelli: earlier talk", source: "discord:g/1/0", channel: "marlin", occurred_at: new Date(Date.now() - 3 * 86_400_000).toISOString() }, KEY);
+  const withContext = (await get(app, "/browse/api/pulse/thread?source=discord:g/1/1", KEY)).body.graph.nodes;
+  assert(withContext.some((n: { source?: string }) => n.source === "discord:g/1/0"), "the channel's previous conversation is there for context");
+  assertEquals(withContext.filter((n: { hit?: boolean }) => n.hit).length, 1, "only the opened message is marked");
   assertEquals((await get(app, "/browse/api/pulse/thread?source=discord:g/9/9", KEY)).status, 400);
   const page = await app.request("/portal");
   assertEquals(page.status, 200);

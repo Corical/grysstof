@@ -97,9 +97,18 @@ const ROUTES = new Map<string, Route>(Object.entries({
   "/pulse/thread": async (q, ports, scope) => {
     const source = param(q, "source") ?? "";
     const p = await pulseInputs(ports, scope);
-    const conv = conversations(p.messages, GAP_MINUTES).find((c) => c.messages.some((m) => m.source === source));
+    const all = conversations(p.messages, GAP_MINUTES);
+    const conv = all.find((c) => c.messages.some((m) => m.source === source));
     if (!conv) throw new Error(`No conversation holds ${source}`);
-    return { ...summariseConversation(conv, clientForChannel(conv.channel, p.clients, p.overrides).client), messages: conv.messages };
+    const opened = conv.messages.find((m) => m.source === source)!;
+    // The bubbles for this conversation, so whatever opens a thread shows its own graph, never a stale search,
+    // with the channel's conversation before and after it for context. Only the opened message is marked.
+    const inChannel = all.filter((c) => c.channel === conv.channel);
+    const at = inChannel.indexOf(conv);
+    const around = [inChannel[at - 1], inChannel[at + 1]].filter((c): c is Conversation => !!c).map((c) => c.opener.id);
+    const graph = exploreGraph([opened.id, ...around], p.messages, (ch) => clientForChannel(ch, p.clients, p.overrides).client, { gapMinutes: GAP_MINUTES, maxMessages: 140 });
+    for (const n of graph.nodes) if (n.kind === "message") n.hit = n.id === opened.id;
+    return { ...summariseConversation(conv, clientForChannel(conv.channel, p.clients, p.overrides).client), messages: conv.messages, graph };
   },
   "/recall": async (q, { memory }, scope) => ({
     thoughts: await memory.recall(scope, q.get("q") ?? "", { limit: limitOf(q, 50, 500), minScore: 0 }),
