@@ -1,6 +1,39 @@
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals, assertRejects } from "@std/assert";
 import { InProcessLedger, JsonlLedger } from "../adapters/ledger/in-process.ts";
+import { RecordingLog } from "../adapters/log.ts";
 import { runLedgerContract } from "./ledger.contract.ts";
+
+Deno.test("[ledger/jsonl] one failed append does not poison the ledger: once the cause is fixed the next writes land, and the failure is logged", async () => {
+  const dir = Deno.makeTempDirSync({ prefix: "ob1-jsonl-poison-" });
+  const sub = `${dir}/missing`;
+  const log = new RecordingLog();
+  const S = { tenant: "alice", actor: "agent:alice" };
+  try {
+    const l = new JsonlLedger(`${sub}/ledger.jsonl`, undefined, { log });
+    const queued = await Promise.allSettled([
+      l.assert(S, { subject: "loop:1", claim: "first", source: "s" }),
+      l.assert(S, { subject: "loop:1", claim: "queued behind it", source: "s" }),
+    ]);
+    assertEquals(queued.map((r) => r.status), ["rejected", "rejected"], "the directory is missing for both");
+    assertEquals(await l.history(S, "loop:1"), [], "a write that did not persist is not applied either");
+    Deno.mkdirSync(sub);
+    const second = await l.assert(S, { subject: "loop:2", claim: "second", source: "s" });
+    const third = await l.assert(S, { subject: "loop:2", claim: "third", source: "s", supersedes: second.id });
+    assertEquals((await l.latest(S, "loop:2"))?.id, third.id);
+    assertEquals((await Deno.readTextFile(`${sub}/ledger.jsonl`)).trim().split("\n").length, 2, "only the two good writes on disk");
+    await assertRejects(() => l.assert(S, { subject: "loop:2", claim: "stale", source: "s", supersedes: second.id }), Error, "already superseded");
+
+    const failed = log.events.filter((e) => e.event === "ledger.write_failed");
+    assertEquals(failed.length, 2, "each failed append logged once; a refused supersede is not a write failure");
+    assertEquals([failed[0].level, failed[0].fields?.ledger, failed[0].fields?.kind, failed[0].fields?.subject], ["error", "jsonl", "assert", "loop:1"]);
+
+    const replayed = new JsonlLedger(`${sub}/ledger.jsonl`);
+    assertEquals((await replayed.history(S, "loop:2")).map((f) => f.claim), ["third", "second"]);
+    assertEquals(await replayed.history(S, "loop:1"), []);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 runLedgerContract("ledger/in-process", () => Promise.resolve({ ledger: new InProcessLedger() }));
 
