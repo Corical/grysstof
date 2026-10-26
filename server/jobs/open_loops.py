@@ -7,8 +7,12 @@ claim in code, writes one ledger line per change through /mcp (C1, C2), and post
 
 Usage:
   open_loops.py --env FILE --check     reads, settings present, Pi clock vs Discord; no model, no writes, no post
-  open_loops.py --env FILE             dry run: model pass, prints "would open N, close M, update K" and the post
+  open_loops.py --env FILE             dry run: model pass, prints "would unpark N", "would open N, close M,
+                                       update K" and the post; writes nothing
   open_loops.py --env FILE --post      writes the ledger lines, then posts to the webhook
+
+A parked loop whose `until` has passed is put back to OPEN at the start of the run (one OPEN line superseding
+the PARKED line, every field carried from the OPEN line before it) and then takes part like any open loop.
   --lock FILE                          take this lock for the run; if another run holds it, exit at once
                                        (and, with --post, say so in the channel when it is over an hour old)
 
@@ -179,6 +183,27 @@ def open_line(f: dict) -> str:
 def closed_line(key, by_message, closed, reason) -> str:
     return compose("CLOSED/1", [("key", sanitise(key)), ("by_message", sanitise(by_message)),
                                 ("closed", sanitise(closed)), ("reason", sanitise(reason, 200))])
+
+
+OPEN_FIELDS = ("key", "client", "type", "owner", "channel", "channel_id", "opened", "reopened", "title", "summary", "evidence")
+
+
+def read_line(claim):
+    """A C1 line read back: (tag, fields), or None when it is not one readable line."""
+    if not isinstance(claim, str) or "\n" in claim or "\r" in claim:
+        return None
+    parts = [p.strip() for p in claim.split("|")]
+    m = re.fullmatch(r"(OPEN|CLOSED|RESOLVED|PARKED)/1", parts[0])
+    if not m:
+        return None
+    fields = {}
+    for p in parts[1:]:
+        name, eq, value = p.partition("=")
+        name = name.strip()
+        if not eq or not name or name in fields:
+            return None
+        fields[name] = value.strip()
+    return m.group(1), fields
 
 
 # --- HTTP -----------------------------------------------------------------------------------------------------
@@ -838,6 +863,92 @@ def new_open(key: str, it: dict, opened: datetime, mapping: dict, known_clients:
     return Write("open", key, open_line(fields), None, op["source"], op["link"], iso(opened), record)
 
 
+# --- parked loops whose time is up ----------------------------------------------------------------------------
+
+
+def until_of(lp: dict):
+    """When a parked loop comes back. A bare date (what the Park button writes) is the start of that day in SAST."""
+    u = str(lp.get("until") or "").strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", u):
+        try:
+            return datetime.fromisoformat(u).replace(tzinfo=SAST)
+        except ValueError:
+            return None
+    return parse_time(u)
+
+
+def due_parked(loops: list, now: datetime) -> list:
+    return [lp for lp in loops if isinstance(lp, dict) and state_of(lp) == "parked"
+            and (until_of(lp) is not None and until_of(lp) <= now)]
+
+
+def previous_open(facts: list, parked_id, key: str):
+    """The OPEN line a PARKED line covers: back along `supersedes` first, else the newest readable OPEN line."""
+    by_id = {f.get("id"): f for f in facts if isinstance(f, dict)}
+
+    def open_fields(f):
+        r = read_line(f.get("claim"))
+        if not r or r[0] != "OPEN" or any(n not in r[1] for n in OPEN_FIELDS) or r[1]["key"] != key:
+            return None
+        return r[1] if parse_time(r[1]["opened"]) and r[1]["type"] in TYPES else None
+
+    seen = {parked_id}
+    cur = by_id.get((by_id.get(parked_id) or {}).get("supersedes"))
+    while cur is not None and cur.get("id") not in seen:
+        seen.add(cur.get("id"))
+        found = open_fields(cur)
+        if found:
+            return cur, found
+        cur = by_id.get(cur.get("supersedes"))
+    for f in facts:  # /history is newest first
+        found = open_fields(f) if isinstance(f, dict) else None
+        if found:
+            return f, found
+    return None
+
+
+def unpark_write(g: Grysstof, lp: dict, now: datetime) -> Write:
+    """One OPEN line superseding the PARKED line, every OPEN field carried from the OPEN line before it."""
+    subject = f"loop:{lp['key']}"
+    hit = previous_open(g.history(subject), lp.get("lineId"), str(lp["key"]))
+    if not hit:
+        raise JobError(f"no readable OPEN line in the history of {subject}")
+    fact, f = hit
+    reopened = None if f["reopened"] in ("", "-") else f["reopened"]
+    evidence = [e for e in f["evidence"].split(",") if e.strip()]
+    fields = {"key": lp["key"], "client": f["client"], "type": f["type"], "owner": f["owner"], "channel": f["channel"],
+              "channel_id": f["channel_id"], "opened": f["opened"], "reopened": reopened, "title": f["title"],
+              "summary": f["summary"], "evidence": evidence}
+    proof = str(fact.get("proof") or lp.get("proof") or "")
+    record = {**lp, "state": "open", "client": f["client"], "type": f["type"], "owner": f["owner"], "channel": f["channel"],
+              "channelId": f["channel_id"], "opened": f["opened"], "reopened": reopened, "title": f["title"],
+              "summary": f["summary"], "evidence": evidence_list(evidence), "proof": proof,
+              "until": None, "byUser": None, "byName": None, "note": None}
+    return Write("unpark", str(lp["key"]), open_line(fields), lp.get("lineId"), opener_source({"proof": proof}), proof, iso(now), record)
+
+
+def unpark_due(g: Grysstof, loops: list, now: datetime, post: bool) -> tuple:
+    """Parked loops whose `until` has passed, back to OPEN. Returns the unpark writes that hold and the failures."""
+    done, failed = [], 0
+    for lp in due_parked(loops, now):
+        try:
+            w = unpark_write(g, lp, now)
+        except JobError as e:
+            log("unpark.failed", err=True, key=lp.get("key"), error=one_line(e)[:200])
+            failed += 1
+            continue
+        if post:
+            status, fid = write_line(g, w)
+            if status != "ok":
+                failed += 1
+                continue
+            w.record["lineId"] = fid  # a close or update later in this run supersedes this line, not the PARKED one
+        else:
+            w.record["lineId"] = f"(after unpark of {lp.get('lineId')})"
+        done.append(w)
+    return done, failed
+
+
 # --- writing --------------------------------------------------------------------------------------------------
 
 
@@ -846,39 +957,41 @@ def landed(facts: list, w: Write):
                  and (f.get("supersedes") or None) == (w.supersedes or None)), None)
 
 
-def write_line(g: Grysstof, w: Write) -> str:
-    """One capture_thought. On any failure, re-read the loop first: written already, changed by someone, or retry once."""
+def write_line(g: Grysstof, w: Write) -> tuple:
+    """One capture_thought. On any failure, re-read the loop first: written already, changed by someone, or retry once.
+    Returns (status, the new line's id or None)."""
     subject = f"loop:{w.key}"
     for attempt in (1, 2):
         try:
             fid = g.capture(w)
             log("write.ok", kind=w.kind, key=w.key, id=fid, attempt=attempt)
-            return "ok"
+            return "ok", fid
         except JobError as e:
             log("write.failed", err=True, kind=w.kind, key=w.key, attempt=attempt, error=one_line(e)[:200])
         try:
             facts = g.history(subject)
         except JobError as e:
             log("write.reread_failed", err=True, key=w.key, error=one_line(e)[:200])
-            return "failed"
+            return "failed", None
         hit = landed(facts, w)
         if hit:
             log("write.landed_despite_error", key=w.key, id=hit.get("id"))
-            return "ok"
+            return "ok", hit.get("id")
         if attempt == 2:
-            return "failed"
+            return "failed", None
         head = next((f for f in facts if isinstance(f, dict) and not f.get("supersededBy")), None)
         if (w.supersedes and (head is None or head.get("id") != w.supersedes)) or (not w.supersedes and facts):
             log("write.conflict", err=True, key=w.key, detail="the loop changed since it was read; not retried",
                 expected=w.supersedes or "-", head=(head or {}).get("id", "-"))
-            return "conflict"
-    return "failed"
+            return "conflict", None
+    return "failed", None
 
 
 def apply_plan(g: Grysstof, writes: list) -> tuple:
     done, failed = [], 0
     for w in writes:
-        if write_line(g, w) == "ok":
+        status, _ = write_line(g, w)
+        if status == "ok":
             done.append(w)
         else:
             failed += 1
@@ -984,6 +1097,14 @@ def run(env: dict, post: bool) -> int:
     g = Grysstof(env["GRYSSTOF_URL"], env["MCP_ACCESS_KEY"])
     s = read_state(g, now)
     msgs, lr, mapping = s["msgs"], s["loops"], s["mapping"]
+    unparked, unpark_failures = unpark_due(g, lr["loops"], now, post)
+    if post:
+        log("unparked", count=len(unparked), failed=unpark_failures)
+    else:
+        print(f"would unpark {len(unparked)}")
+        for w in unparked:
+            print(f"  unpark loop:{w.key} supersedes {w.supersedes} :: {w.claim}")
+    lr = {**lr, "loops": project(lr["loops"], unparked)}  # an unparked loop takes part in this run as open
     members.learn(msgs)
     portal_ids = {src.rsplit("/", 1)[-1] for src in s["portal"]}
     links = {m["msg_id"]: m["link"] for m in msgs}
@@ -1001,7 +1122,7 @@ def run(env: dict, post: bool) -> int:
     except ModelError as e:
         log("model.failed", err=True, error=one_line(e)[:300])
         text = build_post(now, lr["loops"], model_failed=True, not_evaluated=not_evaluated, unreadable=unreadable,
-                          portal_ids=portal_ids, links=links)
+                          write_failures=unpark_failures, portal_ids=portal_ids, links=links)
         if post:
             log("posted", messages=send(env["OPEN_LOOPS_WEBHOOK"], text))
         else:
@@ -1016,11 +1137,12 @@ def run(env: dict, post: bool) -> int:
     if plan.counts:
         log("checks", **{k: v for k, v in sorted(plan.counts.items())})
     by_kind = Counter(w.kind for w in plan.writes)
-    failures = 0
+    failures = unpark_failures
     if post:
-        applied, failures = apply_plan(g, plan.writes)
+        applied, write_failures = apply_plan(g, plan.writes)
+        failures += write_failures
         done = Counter(w.kind for w in applied)
-        log("written", opened=done["open"], closed=done["close"], updated=done["update"], failed=failures)
+        log("written", opened=done["open"], closed=done["close"], updated=done["update"], failed=write_failures)
     else:
         applied = plan.writes
         print(f"would open {by_kind['open']}, close {by_kind['close']}, update {by_kind['update']}")
@@ -1057,6 +1179,7 @@ def run_check(env: dict) -> int:
             s = read_state(Grysstof(env["GRYSSTOF_URL"], env["MCP_ACCESS_KEY"]), now_sast())
             states = Counter(state_of(lp) for lp in s["loops"]["loops"] if isinstance(lp, dict))
             print(f"grysstof: {len(s['msgs'])} messages in the window, loops {dict(sorted(states.items()))}, "
+                  f"{len(due_parked(s['loops']['loops'], now_sast()))} parked due back, "
                   f"{len(s['loops'].get('unreadable') or [])} unreadable, portal lists {len(s['portal'])} loose ends")
         except JobError as e:
             print(f"grysstof: FAILED {one_line(e)[:300]}")

@@ -1081,6 +1081,83 @@ class Run(JobCase):
         self.assertEqual(len([ln for ln in err.getvalue().splitlines() if ln.strip()]), 1)
 
 
+class Unpark(JobCase):
+    TITLE = "Quarterly review pack for Servest"
+
+    def parked_net(self, until, *, thoughts=(), with_open_line=True):
+        opened = ago(300)
+        key = snow(opened)
+        proof = f"https://discord.com/channels/{GUILD}/{SERVEST}/{key}"
+        # The OPEN line as it sits in the ledger, written out by hand from C1.
+        open_claim = (f"OPEN/1 | key={key} | client=servest | type=unticketed_ask | owner=Kelli | channel=servest | "
+                      f"channel_id={SERVEST} | opened={iso(opened)} | reopened=- | title={self.TITLE} | "
+                      f"summary=The quarterly review pack was asked for. | evidence={key}")
+        parked = loop_rec(key, opened=opened, state="parked", title=self.TITLE, summary="(as the view shows it)", line="fact_parked")
+        parked.update({"until": until, "byUser": KELLI, "byName": "kelli", "note": "after the QBR"})
+        net = FakeNet(thoughts=thoughts, loops=loops_reply(parked), model='{"existing": [], "new": []}')
+        history = [{"id": "fact_parked", "subject": f"loop:{key}", "proof": proof, "supersedes": "fact_open" if with_open_line else None,
+                    "claim": f"PARKED/1 | key={key} | by_user={KELLI} | by_name=kelli | until={until} | note=after the QBR"}]
+        if with_open_line:
+            history.append({"id": "fact_open", "subject": f"loop:{key}", "proof": proof, "supersededBy": "fact_parked", "claim": open_claim})
+        net.ledger[f"loop:{key}"] = history
+        return net, key, open_claim
+
+    def test_an_expired_parked_loop_is_unparked_and_offered(self):
+        for until in ("2026-10-26", "2026-10-27", "2026-10-27T05:00:00Z"):  # yesterday, today, 07:00 SAST today
+            with self.subTest(until=until):
+                net, key, open_claim = self.parked_net(until)
+                code, out, err = self.run_main(net, "--post")
+                self.assertEqual(code, 0, out + err)
+                [w] = net.captures_for(key)
+                self.assertEqual(w["supersedes"], "fact_parked")
+                tag, fields = parse_line(w["content"])
+                self.assertEqual(tag, "OPEN/1")
+                self.assertEqual(fields, parse_line(open_claim)[1], "every OPEN field comes from the OPEN line before it")
+                self.assertNotIn("note=", w["content"])
+                self.assertEqual(w["source"], f"discord:{GUILD}/{SERVEST}/{key}")
+                self.assertIn(f"key {key}", net.model_requests[0]["messages"][0]["content"], "it is offered to the model")
+                self.assertIn(self.TITLE, self.posted(net))
+
+    def test_a_parked_loop_not_yet_due_is_left_alone(self):
+        for until in ("2026-10-28", "2026-10-27T06:00:00Z", "not a date", ""):  # tomorrow, 08:00 SAST today, unreadable
+            with self.subTest(until=until):
+                net, key, _ = self.parked_net(until)
+                code, _, _ = self.run_main(net, "--post")
+                self.assertEqual(code, 0)
+                self.assertEqual(net.captures, [])
+                self.assertNotIn(key, net.model_requests[0]["messages"][0]["content"])
+                self.assertNotIn(self.TITLE, self.posted(net))
+
+    def test_dry_run_says_it_would_unpark_and_writes_nothing(self):
+        net, key, _ = self.parked_net("2026-10-26")
+        code, out, _ = self.run_main(net)
+        self.assertEqual(code, 0)
+        self.assertEqual((net.captures, net.posts), ([], []))
+        self.assertIn("would unpark 1", out)
+        self.assertIn(f"key {key}", net.model_requests[0]["messages"][0]["content"])
+
+    def test_a_close_later_in_the_run_supersedes_the_unpark_line_not_the_parked_one(self):
+        reply = thought(ago(10), "Kelli", "The pack is on the portal.", author_id=KELLI)
+        net, key, _ = self.parked_net("2026-10-26", thoughts=[reply])
+        net.model = json.dumps({"existing": [{"key": key, "status": "closed_by", "message": "m1"}], "new": []})
+        code, out, err = self.run_main(net, "--post")
+        self.assertEqual(code, 0, out + err)
+        unpark, close = net.captures_for(key)
+        self.assertEqual(unpark["supersedes"], "fact_parked")
+        self.assertTrue(close["content"].startswith("CLOSED/1"))
+        head = next(f for f in net.ledger[f"loop:{key}"] if f["claim"] == unpark["content"])
+        self.assertEqual(close["supersedes"], head["id"])
+
+    def test_no_open_line_in_the_history_fails_loudly_and_the_loop_stays_parked(self):
+        net, key, _ = self.parked_net("2026-10-26", with_open_line=False)
+        code, out, err = self.run_main(net, "--post")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(net.captures, [])
+        self.assertIn("unpark.failed", err)
+        self.assertNotIn(key, net.model_requests[0]["messages"][0]["content"])
+        self.assertIn("1 ledger write failed", self.posted(net))
+
+
 class Check(JobCase):
     def test_check_reads_and_compares_the_clock_and_writes_nothing(self):
         net = fixture_net(skew_seconds=12)
