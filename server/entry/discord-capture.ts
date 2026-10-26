@@ -26,7 +26,7 @@
 import { advance, type Capture, type DiscordMessage, distil, type Names, type Reaction, type Watermarks } from "../writer/discord.ts";
 import { type ReactionIo, syncChannelReactions, syncMessageReactions } from "../writer/discord-reactions.ts";
 import { guildAllowed, type Interaction, makeGuildFilter, onInteraction, type PaIo, paConfig, parseIdList, registerCommands } from "../writer/discord-pa.ts";
-import { browseLoops, discordClient, type HttpDeps, mcpCapture } from "../writer/discord-rest.ts";
+import { browseHistory, browseLoops, discordClient, type HttpDeps, mcpCapture, mcpTool } from "../writer/discord-rest.ts";
 
 const API = "https://discord.com/api/v10";
 const INTENTS = (1 << 0) | (1 << 9) | (1 << 10) | (1 << 15); // GUILDS, GUILD_MESSAGES, GUILD_MESSAGE_REACTIONS, MESSAGE_CONTENT
@@ -59,12 +59,15 @@ async function log(fields: Record<string, unknown>) {
 // --- which guilds are captured, and the loops assistant ---
 const captureGuilds = parseIdList(Deno.env.get("DISCORD_CAPTURE_GUILDS"));
 const captureGuild = makeGuildFilter(captureGuilds, (guild) => void log({ event: "capture.guild_skipped", guild, hint: "not in DISCORD_CAPTURE_GUILDS" }));
-const pa = paConfig(Deno.env.get("PA_ENABLED"), Deno.env.get("PA_USERS"));
+const pa = paConfig(Deno.env.get("PA_ENABLED"), Deno.env.get("PA_USERS"), captureGuilds);
 const paRest: HttpDeps = { onRateLimit: (f) => void log({ event: "discord.rate_limited", ...f }) };
+const tool = mcpTool(brainUrl, key!, paRest);
 const paIo: PaIo = {
   discord: discordClient(token!, paRest),
   loops: browseLoops(brainUrl, key!, paRest),
   capture: mcpCapture(brainUrl, key!, paRest),
+  history: browseHistory(brainUrl, key!, paRest),
+  supersede: (actor, newerId, olderId) => tool(actor, "supersede_fact", { newer_id: newerId, older_id: olderId }),
   log,
   now: () => new Date(),
 };

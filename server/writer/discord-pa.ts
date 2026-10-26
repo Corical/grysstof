@@ -21,8 +21,6 @@ export const PAGE_SIZE = 6;
 export const PARK_DAYS = 7;
 /** state:closed shows loops closed or resolved this recently (plan 5, Lane C item 3). */
 export const CLOSED_VIEW_DAYS = 14;
-/** A press on a closed or resolved loop re-reads this far back, comfortably wider than the view. */
-const REREAD_DAYS = 30;
 const DAY = 86_400_000;
 const MAX_CONTENT = 2000;
 /** A list leaves room under Discord's 2,000 for the status line a later press adds. */
@@ -30,7 +28,8 @@ const LIST_BUDGET = 1900;
 
 // ---------- configuration (C6) ----------
 
-export type PaConfig = { enabled: boolean; users: ReadonlySet<string> };
+/** `guilds`: DISCORD_CAPTURE_GUILDS; when set, an interaction from any other guild (or a DM) is refused. */
+export type PaConfig = { enabled: boolean; users: ReadonlySet<string>; guilds?: ReadonlySet<string> };
 
 /** A comma-separated id list; unset or blank is `undefined` (meaning "no list"), never an empty set. */
 export function parseIdList(s: string | undefined): Set<string> | undefined {
@@ -39,8 +38,8 @@ export function parseIdList(s: string | undefined): Set<string> | undefined {
 }
 
 /** PA_ENABLED is on only when it says so; PA_USERS unset means nobody is permitted. */
-export function paConfig(enabled: string | undefined, users: string | undefined): PaConfig {
-  return { enabled: /^(true|1|yes|on)$/i.test((enabled ?? "").trim()), users: parseIdList(users) ?? new Set() };
+export function paConfig(enabled: string | undefined, users: string | undefined, guilds?: ReadonlySet<string>): PaConfig {
+  return { enabled: /^(true|1|yes|on)$/i.test((enabled ?? "").trim()), users: parseIdList(users) ?? new Set(), ...(guilds ? { guilds } : {}) };
 }
 
 /** DISCORD_CAPTURE_GUILDS: no list means every guild, as before; with a list, only those. */
@@ -104,6 +103,10 @@ export type PaIo = {
   loops: (query: Record<string, string>) => Promise<unknown>;
   /** capture_thought as `actor`. */
   capture: (actor: string, args: Record<string, unknown>) => Promise<McpAnswer>;
+  /** GET /browse/api/history?subject=…, parsed: every line of one subject, to find a fork's heads. */
+  history: (subject: string) => Promise<unknown>;
+  /** supersede_fact as `actor`: an existing newer line replaces an older current one. */
+  supersede: (actor: string, newerId: string, olderId: string) => Promise<McpAnswer>;
   log: (fields: Record<string, unknown>) => unknown;
   now: () => Date;
 };
@@ -187,12 +190,15 @@ const VIEW_NAME: Record<View, string> = { o: "open", p: "parked", c: "closed" };
 const VIEW_TITLE: Record<View, string> = { o: "Open loops", p: "Parked loops", c: "Closed and resolved, last 14 days" };
 const EMPTY: Record<View, string> = { o: "nothing open.", p: "nothing parked.", c: "nothing closed or resolved in the last 14 days." };
 
+/** The most /loops returns in one call; the PA asks for all of it, so the newest loops are listed too (row 8). */
+const READ_LIMIT = "2000";
+
 async function fetchView(io: PaIo, view: View, client: string | null, now: Date): Promise<Read> {
   const states: LoopState[] = view === "o" ? ["open"] : view === "p" ? ["parked"] : ["closed", "resolved"];
   const since = view === "c" ? new Date(now.getTime() - CLOSED_VIEW_DAYS * DAY).toISOString() : undefined;
   const out: Read = { loops: [], unreadable: 0, total: 0 };
   for (const state of states) {
-    const r = readLoops(await io.loops({ state, ...(since ? { since } : {}), ...(client ? { client } : {}) }));
+    const r = readLoops(await io.loops({ state, ...(since ? { since } : {}), ...(client ? { client } : {}), limit: READ_LIMIT }));
     out.loops.push(...r.loops.filter((l) => l.state === state));
     out.unreadable = Math.max(out.unreadable, r.unreadable); // the same unreadable lines come back with every state
     out.total += r.total;
@@ -201,15 +207,18 @@ async function fetchView(io: PaIo, view: View, client: string | null, now: Date)
   return out;
 }
 
-/** The loop as it stands now, if it is still in the state the button expected. */
-async function findLoop(io: PaIo, expected: LoopState, key: string, now: Date): Promise<Loop | undefined> {
-  const since = expected === "closed" || expected === "resolved" ? new Date(now.getTime() - REREAD_DAYS * DAY).toISOString() : undefined;
-  return readLoops(await io.loops({ state: expected, ...(since ? { since } : {}) })).loops.find((l) => l.key === key && l.state === expected);
+/**
+ * One loop as it stands now, in whatever state, by key (C3 `key=`, v3.1). The limit and the
+ * client-side key match keep it right against a route that does not filter by key yet.
+ */
+async function findLoop(io: PaIo, key: string): Promise<Loop | undefined> {
+  return readLoops(await io.loops({ state: "all", key, limit: READ_LIMIT })).loops.find((l) => l.key === key);
 }
 
 // ---------- custom_id ----------
 
-const KEY_RE = /^\d{1,25}(?::[0-9a-z]{1,8}){0,2}$/;
+/** The key grammar of the v3.1 addendum. TODO: import KEY_RE from core/loops.ts once lane A exports it. */
+export const KEY_RE = /^\d{17,20}(:[a-z])?(:\d{1,3})?$/;
 const CLIENT_RE = /^[a-z0-9][a-z0-9._-]{0,39}$/;
 type Act = "R" | "P" | "U" | "O";
 /** Which loop states each action is offered on: Resolve on open and parked, Park on open, Unpark on parked, Reopen on closed and resolved. */
@@ -284,11 +293,13 @@ function itemLine(n: number, l: Loop, now: Date, w: Widths): string {
  * Next: the six after the last loop shown. Prev: up to six strictly before the first loop shown,
  * so going back never repeats a loop from the page you came from. The cursor is a position
  * (opened, key), not an index, so loops added or resolved between presses shift nothing.
- * Nothing left in that direction: the last (or first) page.
+ * From (after a press): the six starting at the first loop shown, or the next one if it is gone,
+ * so the page re-read from /loops is the page the person was on. Nothing left in that direction:
+ * the last (or first) page.
  */
-function pageOf(sorted: Loop[], cursor: Pos | null, dir: "N" | "P"): { start: number; items: Loop[] } {
-  if (cursor && dir === "N") {
-    const i = sorted.findIndex((l) => cmp(posOf(l), cursor) > 0);
+function pageOf(sorted: Loop[], cursor: Pos | null, dir: Dir): { start: number; items: Loop[] } {
+  if (cursor && (dir === "N" || dir === "F")) {
+    const i = sorted.findIndex((l) => dir === "N" ? cmp(posOf(l), cursor) > 0 : cmp(posOf(l), cursor) >= 0);
     const start = i < 0 ? Math.max(0, sorted.length - PAGE_SIZE) : i;
     return { start, items: sorted.slice(start, start + PAGE_SIZE) };
   }
@@ -332,7 +343,9 @@ function buttonsFor(view: View, client: string | null, sorted: Loop[], start: nu
 
 type Body = { content: string; components: ComponentRow[] };
 
-function renderList(view: View, client: string | null, data: Read, cursor: Pos | null, dir: "N" | "P", now: Date): Body {
+type Dir = "N" | "P" | "F";
+
+function renderList(view: View, client: string | null, data: Read, cursor: Pos | null, dir: Dir, now: Date): Body {
   const { start, items } = pageOf(data.loops, cursor, dir);
   const head = `**${VIEW_TITLE[view]}**${client ? ` · ${esc(client)}` : ""}`;
   const top = items.length ? `${head} · ${start + 1}–${start + items.length} of ${data.loops.length}` : `${head} · ${EMPTY[view]}`;
@@ -349,26 +362,27 @@ function renderList(view: View, client: string | null, data: Read, cursor: Pos |
 
 const STATUS_RE = /^(›|⚠) /;
 
-/** The message a button sat on, with a status line on top, the item struck through (when the press took), and that loop's buttons dead. */
-function markMessage(msg: Interaction["message"], n: number, key: string, status: string, strike: boolean): Body {
-  const lines = (msg?.content ?? "").split("\n").filter((l, i) => !(i === 0 && STATUS_RE.test(l)));
-  const marked = lines.map((l) => (strike && l.startsWith(`${n}. `) ? `~~${l}~~` : l));
-  const components = (msg?.components ?? []).map((row) => ({
-    type: row.type,
-    components: (row.components ?? []).map((b) => {
+/**
+ * Which page a pressed button sat on: the view, client and first loop shown, read from the page's
+ * Prev button. Only the position comes from the old message; what is shown comes from /loops (row 21).
+ */
+function pageOfMessage(msg: Interaction["message"], state: LoopState): { view: View; client: string | null; from: Pos | null } {
+  for (const row of msg?.components ?? []) {
+    for (const b of row.components ?? []) {
       const p = parseCustomId(b.custom_id);
-      return p?.kind === "act" && p.key === key ? { ...b, disabled: true } : b;
-    }),
-  }));
-  return { content: cutSafe([status, ...marked].join("\n").trimEnd(), MAX_CONTENT), components };
+      if (p?.kind === "nav" && p.dir === "P") return { view: p.view, client: p.client, from: p.cursor };
+    }
+  }
+  return { view: state === "open" ? "o" : state === "parked" ? "p" : "c", client: null, from: null };
 }
+
+/** One status line on top of a body, inside Discord's 2,000. */
+const withStatus = (status: string, body: Body): Body => ({ content: cutSafe(`${status}\n${body.content}`.trimEnd(), MAX_CONTENT), components: body.components });
 
 // ---------- talking to Discord ----------
 
 const NOT_PERMITTED = "You are not permitted to use the loops assistant.";
 const NOT_AVAILABLE = "That is not available.";
-const CHANGED = "⚠ This loop changed since you listed it; run /loops again.";
-const WRITE_TIMEOUT = "⚠ Timed out: the ledger did not answer; check /loops before retrying.";
 const READ_TIMEOUT = "⚠ Grysstof did not answer in time; try /loops again.";
 const NAV_TIMEOUT = "⚠ Grysstof did not answer in time; the page below is unchanged.";
 const HELP = [
@@ -381,6 +395,9 @@ const HELP = [
   "Each press writes one line to Grysstof's ledger. Nothing is posted in a channel and nobody is pinged.",
 ].join("\n");
 const DONE: Record<Act, string> = { R: "Resolved", P: "Parked", U: "Unparked", O: "Reopened" };
+const LABEL: Record<Act, string> = { R: "Resolve", P: "Park", U: "Unpark", O: "Reopen" };
+/** The press log's `action` field (row 22). */
+const ACTION: Record<Act, string> = { R: "resolve", P: "park", U: "unpark", O: "reopen" };
 const NOTE: Record<Act, string> = { R: "pressed Resolve in /loops", P: "pressed Park in /loops", U: "pressed Unpark in /loops", O: "pressed Reopen in /loops" };
 
 async function say(io: Pick<PaIo, "log">, fields: Record<string, unknown>): Promise<void> {
@@ -437,6 +454,13 @@ export async function onInteraction(cfg: PaConfig, io: PaIo, ix: Interaction): P
 
 async function handle(cfg: PaConfig, io: PaIo, ix: Interaction): Promise<void> {
   const user = ix.member?.user ?? ix.user;
+  if (cfg.enabled && !guildAllowed(cfg.guilds, ix.guild_id)) {
+    // A command registered in another guild before the list was set must not serve the list there (row 20).
+    const answer = ix.type === 4 ? { type: 8, data: { choices: [] } } : [2, 3, 5].includes(ix.type) ? ephemeral(NOT_AVAILABLE) : undefined;
+    if (answer) await callback(io, ix, answer, user);
+    await say(io, { event: "pa.refused", reason: "guild not allowed", guild: ix.guild_id ?? "@me", type: ix.type, user: user?.id, name: user?.username });
+    return;
+  }
   if (!cfg.enabled || !user?.id || !cfg.users.has(user.id)) {
     const reason = cfg.enabled ? "not permitted" : "disabled";
     const answer = cfg.enabled ? (ix.type === 4 ? { type: 8, data: { choices: [] } } : [2, 3, 5].includes(ix.type) ? ephemeral(NOT_PERMITTED) : undefined) : defaultAnswer(ix.type, NOT_AVAILABLE);
@@ -517,38 +541,124 @@ function writeArgs(act: Act, l: Loop, ix: Interaction, user: DiscordUser, now: D
  */
 const isStale = (a: McpAnswer) => a.isError && /\bsuperseded\b/i.test(a.text);
 
+/** `heads` is null when the subject's lines could not be read: the write stands, the fork may remain. */
+type Fork = { heads: number | null; linked: number; failed: number };
+
 /**
- * A press: read the loop as it stands, write one line superseding its current line, and on a stale
+ * A press on a forked loop wrote one line on the head /loops showed. Every other current line of
+ * the subject is now linked to that line with supersede_fact, so one current line is left (row 16).
+ * Writing a second line per head would leave as many heads as before. The heads are read after the
+ * write, so a head added meanwhile is caught; one already replaced by someone else counts as done.
+ */
+async function healFork(io: PaIo, actor: string, key: string, newId: string): Promise<Fork> {
+  let facts: { id: string; supersededBy?: string }[];
+  try {
+    facts = readFacts(await io.history(`loop:${key}`));
+  } catch (e) {
+    await say(io, { event: e instanceof TimeoutError ? "pa.timeout" : "pa.failed", what: "fork_link", key, newer: newId, error: String(e) });
+    return { heads: null, linked: 0, failed: 0 };
+  }
+  const others = facts.filter((f) => !f.supersededBy && f.id !== newId).map((f) => f.id);
+  const out: Fork = { heads: others.length + 1, linked: 0, failed: 0 };
+  const errors: string[] = [];
+  for (const older of others) {
+    try {
+      const a = await io.supersede(actor, newId, older);
+      if (!a.isError || isStale(a)) out.linked++;
+      else {
+        out.failed++;
+        errors.push(a.text);
+      }
+    } catch (e) {
+      out.failed++;
+      errors.push(String(e));
+    }
+  }
+  if (out.failed) await say(io, { event: "pa.failed", what: "fork_link", key, newer: newId, failed: out.failed, errors: errors.map((e) => sanitise(e, 200)) });
+  return out;
+}
+
+/** Every line of /browse/api/history's reply, defensively: only entries with an id are used. */
+function readFacts(value: unknown): { id: string; supersededBy?: string }[] {
+  const facts = (value as { facts?: unknown } | null)?.facts;
+  if (!Array.isArray(facts)) throw new Error("unexpected answer from /browse/api/history");
+  return facts.filter((f): f is { id: string; supersededBy?: string } => !!f && typeof (f as { id?: unknown }).id === "string");
+}
+
+/**
+ * A press: read the loop by key, write one line superseding its current line, and on a stale
  * refusal re-read once and retry only if the loop is still in the state the button expected.
+ * A forked loop has its other heads linked to the new line. Whatever the outcome, the reply is
+ * the page re-read from /loops with one status line on top, never a patch of the old message.
  */
 async function onPress(io: PaIo, ix: Interaction, user: DiscordUser, p: Extract<Parsed, { kind: "act" }>): Promise<void> {
   const now = io.now();
   // The gate only accepts [A-Za-z0-9._:@/-] as an actor and silently substitutes its default otherwise.
   const actor = `discord:${user.username.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 100)}`;
-  const logged = { action: DONE[p.act].toLowerCase().replace(/ed$/, ""), key: p.key, user: user.id, name: user.username };
-  const finish = (status: string, strike: boolean) => edit(io, ix, markMessage(ix.message, p.n, p.key, status, strike), user);
+  const logged = { action: ACTION[p.act], key: p.key, user: user.id, name: user.username };
+  const label = `${LABEL[p.act]} ${p.n}`;
+  const changed = (seen?: Loop) => `⚠ ${label}: this loop changed since you listed it; ${seen ? `it is now ${seen.state}` : "it is no longer listed"}.`;
+  let status: string;
   let stage = "read";
   try {
-    let current = await findLoop(io, p.state, p.key, now);
-    for (let attempt = 0; current; attempt++) {
-      stage = "write";
-      const answer = await io.capture(actor, writeArgs(p.act, current, ix, user, now));
-      if (!answer.isError && /^Recorded fact /.test(answer.text)) {
-        await say(io, { event: "pa.press", ...logged, outcome: "recorded", retried: attempt > 0, line: /^Recorded fact (\S+)/.exec(answer.text)?.[1], superseded: current.lineId });
-        return await finish(`› ${DONE[p.act]} ${p.n}: ${esc(sanitise(current.title || p.key, 80))}`, true);
+    let current = await findLoop(io, p.key);
+    if (!current || current.state !== p.state) {
+      status = changed(current);
+      await say(io, { event: "pa.press", ...logged, outcome: "changed", expected: p.state, now: current?.state ?? "gone" });
+    } else {
+      status = "";
+      for (let attempt = 0; !status; attempt++) {
+        stage = "write";
+        const answer = await io.capture(actor, writeArgs(p.act, current, ix, user, now));
+        if (!answer.isError && /^Recorded fact /.test(answer.text)) {
+          const line = /^Recorded fact (\S+)/.exec(answer.text)?.[1] ?? "";
+          stage = "fork";
+          const fork = current.fork && line ? await healFork(io, actor, p.key, line) : undefined;
+          await say(io, { event: "pa.press", ...logged, outcome: "recorded", retried: attempt > 0, line, superseded: current.lineId, ...(fork ? { fork } : {}) });
+          const forkNote = !fork
+            ? ""
+            : fork.heads === null
+            ? " It had more than one current line, and they could not be read; see /loops."
+            : fork.failed
+            ? ` It had ${fork.heads} current lines; ${fork.failed} could not be replaced, see /loops.`
+            : ` It had ${fork.heads} current lines; all now replaced by this one.`;
+          status = `› ${DONE[p.act]} ${p.n}: ${esc(sanitise(current.title || p.key, 80))}.${forkNote}`;
+          break;
+        }
+        if (!isStale(answer)) throw new Error(answer.isError ? answer.text : `unexpected answer: ${answer.text}`);
+        if (attempt > 0) {
+          status = `⚠ ${label}: this loop changed since you listed it, twice while saving; run /loops again.`;
+          await say(io, { event: "pa.press", ...logged, outcome: "changed", expected: p.state, retried: true });
+          break;
+        }
+        stage = "read";
+        const again = await findLoop(io, p.key);
+        if (!again || again.state !== p.state || again.lineId === current.lineId) {
+          status = changed(again);
+          await say(io, { event: "pa.press", ...logged, outcome: "changed", expected: p.state, now: again?.state ?? "gone" });
+          break;
+        }
+        current = again;
       }
-      if (!isStale(answer)) throw new Error(answer.isError ? answer.text : `unexpected answer: ${answer.text}`);
-      if (attempt > 0) break;
-      stage = "read";
-      const again = await findLoop(io, p.state, p.key, now);
-      current = again && again.lineId !== current.lineId ? again : undefined;
     }
-    await say(io, { event: "pa.press", ...logged, outcome: "changed", expected: p.state });
-    await finish(CHANGED, false);
   } catch (e) {
     const timedOut = e instanceof TimeoutError;
     await say(io, { event: timedOut ? "pa.timeout" : "pa.failed", what: stage, ...logged, error: String(e), ...(e instanceof HttpError ? { status: e.status } : {}) });
-    await finish(timedOut ? WRITE_TIMEOUT : `⚠ Could not record that: ${esc(short(e))}. Check /loops before retrying.`, false);
+    status = timedOut ? `⚠ ${label}: timed out: the ledger did not answer; check /loops before retrying.` : `⚠ ${label}: could not record that: ${esc(short(e))}. Check /loops before retrying.`;
+  }
+  await edit(io, ix, await refreshed(io, ix, user, p.state, status), user);
+}
+
+/** The page the press came from, re-read from /loops, under the press's status line (row 21). */
+async function refreshed(io: PaIo, ix: Interaction, user: DiscordUser, state: LoopState, status: string): Promise<Body> {
+  const where = pageOfMessage(ix.message, state);
+  try {
+    const now = io.now();
+    return withStatus(status, renderList(where.view, where.client, await fetchView(io, where.view, where.client, now), where.from, "F", now));
+  } catch (e) {
+    const timedOut = e instanceof TimeoutError;
+    await say(io, { event: timedOut ? "pa.timeout" : "pa.failed", what: "refresh", user: user.id, view: VIEW_NAME[where.view], error: String(e) });
+    return { content: cutSafe(`${status}\n(could not refresh the list; run /loops again)`, MAX_CONTENT), components: [] };
   }
 }
 
@@ -557,24 +667,29 @@ async function onPress(io: PaIo, ix: Interaction, user: DiscordUser, p: Extract<
 type CommandOption = { type: number; name: string; description: string; required?: boolean; max_length?: number; choices?: { name: string; value: string }[] };
 type CommandDef = { name: string; type: number; description: string; options?: CommandOption[] };
 
-/** The guild commands. No `default_member_permissions`: who may use them is PA_USERS, checked on every interaction. */
+/**
+ * The guild commands. No `default_member_permissions`: who may use them is PA_USERS, checked on every
+ * interaction. Every guild member sees these in the command picker, client staff included, so the
+ * descriptions say nothing about what the list holds and name no client (row 26); restricting the
+ * command to staff roles under Server Settings > Integrations is a deploy step.
+ */
 export const COMMANDS: CommandDef[] = [
   {
     name: "loops",
     type: 1,
-    description: "What the bot believes is still owed, with buttons to resolve or park it. Only you see it.",
+    description: "Team list. Only permitted people can use it.",
     options: [
-      { type: 3, name: "client", description: "Only this client, by short name (for example servest)", required: false, max_length: 40 },
+      { type: 3, name: "client", description: "Narrow by short name", required: false, max_length: 40 },
       {
         type: 3,
         name: "state",
-        description: "Which loops: open (default), parked, or closed in the last 14 days",
+        description: "Which part of the list (open by default)",
         required: false,
         choices: [{ name: "open", value: "open" }, { name: "parked", value: "parked" }, { name: "closed", value: "closed" }],
       },
     ],
   },
-  { name: "loops-help", type: 1, description: "What /loops shows and what its buttons do" },
+  { name: "loops-help", type: 1, description: "How the team list works." },
 ];
 
 /**
