@@ -20,7 +20,17 @@ A parked loop whose `until` has passed (a bare date counts from 00:00 SAST that 
 the run: one `OPEN/1` line superseding the `PARKED/1` line, every field carried from the OPEN line before it, read
 from `/browse/api/history`. It then takes part in the run like any open loop.
 
-Exit codes: 0 done; 1 a failure (one line on stderr, and in the channel with `--post`); 2 settings; 3 lock held.
+With `--post`, the post is built from a fresh `/loops` read after the writes. A loop someone changed during the
+run (a press in the PA) is left as it is and counted as a conflict; that alone does not fail the run.
+
+Time limits: 30 s on every Grysstof, Discord and webhook call; 120 s of silence on the streamed model call; 780 s
+for the reads, the model call and the writes together, so the cron line's `timeout 900` never cuts a run off
+mid-write. SIGTERM runs the failure path (one line, and a post with `--post`). A write that times out is never
+sent again: the job waits 10 s, reads the loop once, and reports the write as unknown if it is not there yet. A
+line that supersedes nothing (a new loop) is never sent twice. A webhook 429 waits for Discord's `retry_after`.
+
+Exit codes: 0 done (conflicts alone included); 1 a failure, a write that failed, timed out unknown or was not
+made before the deadline (one line on stderr, and in the channel with `--post`); 2 settings; 3 lock held.
 
 ### Env file
 
@@ -28,7 +38,9 @@ Stays outside the repo (`/home/corical/open-loops/.env`, chmod 600), passed with
 
 | Key | Meaning |
 |---|---|
-| `ANTHROPIC_API_KEY` | Model calls. |
+| `OPEN_LOOPS_MODEL_PROVIDER` | Which model provider answers `ask(system, user)`. Default `anthropic`, the only one today. |
+| `OPEN_LOOPS_MODEL` | The model id for that provider. Default `claude-sonnet-5-5`. |
+| `ANTHROPIC_API_KEY` | Model calls, when the provider is `anthropic`. |
 | `OPEN_LOOPS_WEBHOOK` | Where the post goes. Needed with `--post`. |
 | `GRYSSTOF_URL` | The server's `/mcp` URL, e.g. `http://localhost:8788/mcp`. `/browse/api` is read from the same base. |
 | `MCP_ACCESS_KEY` | Sent as `x-brain-key`. |
@@ -48,4 +60,5 @@ would always find it held.
 
 From the repo root: `python3 -m unittest discover -s server/jobs -p "test_*.py"`. No network: every call goes to a
 fake. `fixtures/` holds a recorded window, the transcript it must produce, a model answer in the C5 shape and a
-`/loops` reply.
+`/loops` reply. `server/tests/fixtures/c1-sanitise.json` (written by the core) is read too: the job's C1 sanitiser
+must give the same output as `core/loops.ts` for every case; the test skips, with a message, while the file is absent.
