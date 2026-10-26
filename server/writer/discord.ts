@@ -28,7 +28,8 @@ export type DiscordMessage = {
   message_reference?: { message_id?: string; channel_id?: string; guild_id?: string } | null;
 };
 
-export type Names = { guild?: string; channel: string; parent?: string; channelNames?: (id: string) => string | undefined };
+/** `parentId` is the parent channel's id, set only for a thread (a plain channel's own parent is its category, not a conversation). */
+export type Names = { guild?: string; channel: string; parent?: string; parentId?: string; channelNames?: (id: string) => string | undefined };
 
 /** `<@id>` and `<@!id>` become @Name from the message's own mentions list; `<#id>` becomes #channel when known. */
 export function resolveMentions(text: string, mentions: DiscordAuthor[] | undefined, channelNames?: (id: string) => string | undefined): string {
@@ -50,6 +51,12 @@ export type Capture = {
   thread?: string;
   /** For a reply: the source of the message it answers, in the same shape as `source`. */
   inReplyTo?: string;
+  /** Who said it, by Discord user id: stable across renames, so a closing reply can be checked against a member list. */
+  authorId: string;
+  /** Where it was said, by id; for a thread, the thread's own id. */
+  channelId: string;
+  /** For a thread: the parent channel's id, so a reply in a thread matches a loop opened in its channel. */
+  parentId?: string;
 };
 export type Distilled = { skip: string } | Capture;
 
@@ -98,6 +105,9 @@ export function distil(m: DiscordMessage, names: Names): Distilled {
     channel: names.parent ?? names.channel,
     ...(names.parent ? { thread: names.channel } : {}),
     ...(inReplyTo ? { inReplyTo } : {}),
+    authorId: m.author.id,
+    channelId: m.channel_id,
+    ...(names.parentId ? { parentId: names.parentId } : {}),
   };
 }
 
