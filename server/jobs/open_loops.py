@@ -1102,7 +1102,19 @@ def release_lock(fh) -> None:
     fh.close()
 
 
+def readable_console() -> None:
+    """A console that cannot show a character (a Pi in the C locale, a Windows code page) gets a `?`,
+    never an exception: the failure path prints marks like ⚠ and must not die printing them. The post
+    itself goes to Discord as UTF-8 JSON and keeps every mark."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # not a text stream that can be reconfigured (a test's StringIO); nothing to protect
+
+
 def main(argv=None) -> int:
+    readable_console()
     p = argparse.ArgumentParser(description="Open loops: the morning list, kept as a ledger record.")
     p.add_argument("--env", default=str(DEFAULT_ENV), help="env file with the settings (default %(default)s)")
     p.add_argument("--post", action="store_true", help="write the ledger lines and post; without it nothing is written")
