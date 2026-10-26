@@ -2,9 +2,10 @@
 
 Run from the repo root:  python3 -m unittest discover -s server/jobs -p "test_*.py"
 
-These tests try to break the job: wrong channel, a client's reply, a reopened loop and the same reply,
-an SSE reply, an error after the line was written, a model that fails, a lock still held. They do not
-re-state the implementation.
+These tests try to break the job: wrong channel, a client's reply, a reopened loop and the same reply, a
+re-reported loop beside a new ask (S1), a second ask on a resolved opener (S2), evidence from two channels
+(S3), an SSE reply, a write that lands after its timeout, SIGTERM, a deadline, a loop changed mid-run, a model
+that fails, a lock still held. They do not re-state the implementation.
 """
 import contextlib
 import email.message
@@ -12,6 +13,7 @@ import email.utils
 import io
 import json
 import os
+import signal
 import socket
 import sys
 import tempfile
@@ -28,16 +30,19 @@ import open_loops as ol
 
 HERE = Path(__file__).resolve().parent
 FIX = HERE / "fixtures"
+C1_FIXTURE = HERE.parent / "tests" / "fixtures" / "c1-sanitise.json"
 UTC = timezone.utc
 SAST = timezone(timedelta(hours=2))
 NOW = datetime(2026, 10, 27, 7, 30, tzinfo=SAST)  # Tuesday
 GUILD = "268128051500417024"
-SERVEST, SWANZO, INTERNAL = "1300000000000000101", "1300000000000000102", "1300000000000000103"
+SERVEST, SWANZO, INTERNAL, BILLING, URGENT = ("1300000000000000101", "1300000000000000102", "1300000000000000103",
+                                              "1300000000000000104", "1300000000000000105")
 THREAD = "1300000000000000201"  # a thread under #servest
 KELLI, DEVON = "900000000000000001", "900000000000000002"
 THABO, LERATO = "700000000000000001", "700000000000000002"
 BASE = "http://grysstof.test"
 WEBHOOK = "https://discord.com/api/webhooks/1/test"
+ANTHROPIC = "https://api.anthropic.com/v1/messages"
 MEMBERS_RAW = f"{KELLI}:Kelli,{DEVON}:Devon"
 ENV_TEXT = (
     "ANTHROPIC_API_KEY=test-anthropic\n"
@@ -47,6 +52,7 @@ ENV_TEXT = (
     f"XACTCO_MEMBERS={MEMBERS_RAW}\n"
 )
 C1_OPEN_ORDER = ["key", "client", "type", "owner", "channel", "channel_id", "opened", "reopened", "title", "summary", "evidence"]
+EMPTY_ANSWER = '{"existing": [], "new": []}'
 
 _seq = [0]
 
@@ -124,18 +130,18 @@ def loops_reply(*loops, unreadable=(), total=None):
             "total": len(loops) if total is None else total}
 
 
-MAPPING = {"servest": "servest", "swanzo": "swanzo", "dev-internal": None}
+MAPPING = {"servest": "servest", "swanzo": "swanzo", "dev-internal": None, "billing": "billing", "urgent_support": None}
 
 
 def members():
     return ol.parse_members(MEMBERS_RAW)
 
 
-def classify(out, thoughts, loops, *, portal=(), offered=None, mem=None):
+def classify(out, thoughts, loops, *, portal=(), offered=None, mem=None, clients=None):
     msgs = ol.load(thoughts, set(portal))
     m = mem or members()
     m.learn(msgs)
-    return ol.classify(out, msgs, loops, m, MAPPING, NOW, offered), msgs
+    return ol.classify(out, msgs, loops, m, MAPPING, NOW, offered, clients=clients), msgs
 
 
 def mid_of(msgs, t) -> str:
@@ -143,13 +149,26 @@ def mid_of(msgs, t) -> str:
     return next(m["id"] for m in msgs if m["source"] == t["metadata"]["source"])
 
 
+def new_item(title, evidence, *, type_="unanswered_question", owner="unclear", channel="servest", client="servest", summary=None, key=None):
+    item = {"channel": channel, "client": client, "type": type_, "title": title, "summary": summary or f"{title}.",
+            "owner": owner, "evidence": evidence, "why_open": "No reply in the channel."}
+    if key:
+        item["key"] = key
+    return item
+
+
+def writes_of(plan):
+    return {(w.kind, w.key): parse_line(w.claim)[1] for w in plan.writes}
+
+
 # --- the fake network -------------------------------------------------------------------------------------------
 
 
 class FakeResp:
-    def __init__(self, body: bytes, status=200, headers=None):
+    def __init__(self, body: bytes, status=200, headers=None, on_line=None):
         self._buf = io.BytesIO(body)
         self.status = status
+        self.on_line = on_line  # called for every line read: a slow stream
         self.headers = email.message.Message()
         for k, v in (headers or {}).items():
             self.headers[k] = v
@@ -158,7 +177,10 @@ class FakeResp:
         return self._buf.read(*a)
 
     def __iter__(self):
-        return iter(self._buf.readline, b"")
+        for line in iter(self._buf.readline, b""):
+            if self.on_line:
+                self.on_line()
+            yield line
 
     def getcode(self):
         return self.status
@@ -173,8 +195,11 @@ class FakeResp:
         return False
 
 
-def http_error(url, code, body=b'{"error":"boom"}'):
-    return urllib.error.HTTPError(url, code, "error", email.message.Message(), io.BytesIO(body))
+def http_error(url, code, body=b'{"error":"boom"}', headers=None):
+    h = email.message.Message()
+    for k, v in (headers or {}).items():
+        h[k] = v
+    return urllib.error.HTTPError(url, code, "error", h, io.BytesIO(body))
 
 
 def sse(events) -> bytes:
@@ -211,29 +236,52 @@ def rpc(result=None, error=None) -> bytes:
     return json.dumps(body).encode()
 
 
+class FakeClock:
+    def __init__(self):
+        self.t = 10_000.0
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += seconds
+
+
 class FakeNet:
-    """Stands in for urllib.request.urlopen. Grysstof (browse + /mcp with a tiny ledger), Anthropic, Discord."""
+    """Stands in for urllib.request.urlopen: Grysstof (browse, /mcp, a small ledger whose /loops follows what was
+    written), Anthropic, Discord. Faults are consumed in order."""
 
     def __init__(self, *, thoughts=(), pulse=None, loops=None, model=None, mcp="json", skew_seconds=0):
         self.thoughts = sorted(thoughts, key=lambda t: (t["createdAt"], t["id"]))
-        self.pulse = pulse if pulse is not None else {"looseEnds": [], "mapping": [
+        self.pulse = pulse if pulse is not None else {"looseEnds": [], "cards": [{"client": "client:servest"}, {"client": "client:swanzo"}, {"client": "client:billing"}], "mapping": [
             {"channel": "servest", "client": "client:servest", "how": "auto", "messages": 1},
             {"channel": "swanzo", "client": "client:swanzo", "how": "auto", "messages": 1},
-            {"channel": "dev-internal", "client": None, "how": "auto", "messages": 1}]}
-        self.loops = loops if loops is not None else loops_reply()
+            {"channel": "billing", "client": "client:billing", "how": "auto", "messages": 1},
+            {"channel": "dev-internal", "client": None, "how": "auto", "messages": 1},
+            {"channel": "urgent_support", "client": None, "how": "auto", "messages": 1}]}
+        start = loops if loops is not None else loops_reply()
+        self.records = {lp["key"]: dict(lp) for lp in start.get("loops", [])}
+        self.unreadable = list(start.get("unreadable") or [])
         self.model = model
         self.mcp_mode = mcp
-        self.mcp_faults = []  # per-call overrides consumed in order: "error_after_write", "error_before_write", "timeout"
-        self.ledger = {}  # subject -> facts, newest first
-        self.route_override = {}  # route -> FakeResp | Exception
+        self.mcp_faults = []   # "error_after_write", "error_before_write", "timeout", "timeout_late:<reads>", "sigterm", "advance:<s>"
+        self.model_hooks = []  # callables run when the model is called
+        self.ledger = {}       # subject -> facts, newest first
+        self.pending = []      # [subject, fact, args, history reads left] for writes that land late
+        self.route_override = {}
         self.ignore_offset = False
+        self.ignore_loops_offset = False
+        self.repeat_once = False  # /thoughts: the second page repeats the first, once (a backfill shifted offsets)
+        self.webhook_429 = 0
+        self.stream_tick = 0       # seconds the model stream takes per line read
+        self.stream_lines_read = 0
         self.skew_seconds = skew_seconds
+        self.clock = None
         self.calls, self.unexpected, self.posts, self.captures, self.model_requests = [], [], [], [], []
         self._fact = 0
-        for lp in self.loops.get("loops", []):
+        for lp in self.records.values():
             self.ledger[lp["subject"]] = [{"id": lp["lineId"], "subject": lp["subject"], "claim": "OPEN/1 | key=" + lp["key"]}]
 
-    # urlopen(req, timeout=...)
     def __call__(self, req, data=None, timeout=None, **kw):
         if isinstance(req, urllib.request.Request):
             url, method, body = req.full_url, req.get_method(), req.data
@@ -244,12 +292,15 @@ class FakeNet:
         parts = urllib.parse.urlsplit(url)
         query = dict(urllib.parse.parse_qsl(parts.query))
         if url.startswith(BASE + "/browse/api/") and method == "GET":
-            return self.browse(parts.path[len("/browse/api"):], query, url)
+            return self.browse(parts.path[len("/browse/api"):], query)
         if url == BASE + "/mcp" and method == "POST":
             return self.mcp(json.loads(body))
-        if url == "https://api.anthropic.com/v1/messages" and method == "POST":
+        if url == ANTHROPIC and method == "POST":
             return self.anthropic(json.loads(body), url)
         if url.startswith(WEBHOOK) and method == "POST":
+            if self.webhook_429:
+                self.webhook_429 -= 1
+                raise http_error(url, 429, b'{"message": "You are being rate limited.", "retry_after": 0.25, "global": false}')
             self.posts.append(json.loads(body))
             return FakeResp(b'{"id": "1"}')
         if url == "https://discord.com/api/v10/gateway" and method == "GET":
@@ -258,7 +309,7 @@ class FakeNet:
         self.unexpected.append((method, url))
         raise urllib.error.URLError(f"unexpected url in test: {method} {url}")
 
-    def browse(self, route, q, url):
+    def browse(self, route, q):
         over = self.route_override.get(route)
         if isinstance(over, Exception):
             raise over
@@ -269,21 +320,70 @@ class FakeNet:
                     and t["metadata"]["source"].startswith(q.get("source_prefix", ""))]
             assert q.get("order") == "oldest", q
             limit, offset = int(q["limit"]), 0 if self.ignore_offset else int(q.get("offset", "0"))
+            if self.repeat_once and offset > 0:
+                self.repeat_once, offset = False, 0
             return FakeResp(json.dumps({"thoughts": rows[offset:offset + limit]}).encode())
         if route == "/pulse/overview":
             return FakeResp(json.dumps(self.pulse).encode())
         if route == "/loops":
-            return FakeResp(json.dumps(self.loops).encode())
+            recs = sorted(self.records.values(), key=lambda r: (r["opened"], r["key"]))
+            if q.get("state", "open") != "all":
+                recs = [r for r in recs if r["state"] == q.get("state", "open")]
+            if q.get("key"):
+                recs = [r for r in recs if r["key"] == q["key"]]
+            limit = int(q.get("limit", "200"))
+            offset = 0 if self.ignore_loops_offset else int(q.get("offset", "0"))
+            body = {"loops": recs[offset:offset + limit], "unreadable": self.unreadable, "warnings": {"understandFailed": 0}, "total": len(recs)}
+            return FakeResp(json.dumps(body).encode())
         if route == "/history":
-            return FakeResp(json.dumps({"facts": self.ledger.get(q.get("subject", ""), [])}).encode())
+            subject = q.get("subject", "")
+            for p in list(self.pending):
+                if p[0] == subject:
+                    if p[3] <= 0:
+                        self.land(*p[:3])
+                        self.pending.remove(p)
+                    else:
+                        p[3] -= 1
+            return FakeResp(json.dumps({"facts": self.ledger.get(subject, [])}).encode())
         return FakeResp(json.dumps({"error": f"No browse route {route}"}).encode(), status=404)
+
+    def land(self, subject, fact, args):
+        facts = self.ledger.setdefault(subject, [])
+        head = next((f for f in facts if not f.get("supersededBy")), None)
+        if head and fact.get("supersedes"):
+            head["supersededBy"] = fact["id"]
+        facts.insert(0, fact)
+        self.apply_claim(subject, fact["id"], args)
+
+    def flush_pending(self):
+        for p in self.pending:
+            self.land(*p[:3])
+        self.pending = []
+
+    def apply_claim(self, subject, fid, args):
+        tag, f = parse_line(args["content"])
+        key = subject[len("loop:"):]
+        rec = dict(self.records.get(key) or {})
+        if tag == "OPEN/1":
+            rec.update({"key": key, "subject": subject, "lineId": fid, "state": "open", "client": f["client"], "type": f["type"],
+                        "owner": f["owner"], "channel": f["channel"], "channelId": f["channel_id"], "opened": f["opened"],
+                        "reopened": None if f["reopened"] == "-" else f["reopened"], "title": f["title"], "summary": f["summary"],
+                        "evidence": [e for e in f["evidence"].split(",") if e], "proof": args.get("proof"), "closed": None,
+                        "byMessage": None, "byUser": None, "byName": None, "until": None, "note": None, "fork": False, "learnedAt": iso(NOW)})
+        elif tag == "CLOSED/1":
+            rec.update({"lineId": fid, "state": "closed", "closed": f["closed"], "byMessage": f["by_message"], "note": f["reason"], "learnedAt": iso(NOW)})
+        self.records[key] = rec
 
     def mcp(self, body):
         assert body["method"] == "tools/call" and body["params"]["name"] == "capture_thought", body
         args = body["params"]["arguments"]
         self.captures.append(args)
         fault = self.mcp_faults.pop(0) if self.mcp_faults else None
-        if fault == "timeout":
+        if fault == "sigterm":
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        if fault and fault.startswith("advance:"):
+            self.clock.advance(float(fault.split(":")[1]))
+        if fault == "timeout":  # the request dies before the server sees it
             raise socket.timeout("timed out")
         if fault == "error_before_write":
             return FakeResp(rpc({"content": [{"type": "text", "text": "Failed to capture: database is locked"}], "isError": True}))
@@ -294,31 +394,42 @@ class FakeNet:
             return FakeResp(rpc({"content": [{"type": "text", "text": f"Failed to capture: {sup} is not the current line of {subject}"}], "isError": True}))
         self._fact += 1
         fid = f"fact_new{self._fact}"
-        if head and sup:
-            head["supersededBy"] = fid
-        facts.insert(0, {"id": fid, "subject": subject, "claim": args["content"], "source": args.get("source"),
-                         "proof": args.get("proof"), "supersedes": sup, "learnedAt": iso(NOW), "tags": []})
+        fact = {"id": fid, "subject": subject, "claim": args["content"], "source": args.get("source"),
+                "proof": args.get("proof"), "supersedes": sup, "learnedAt": iso(NOW), "tags": []}
+        if fault and fault.startswith("timeout_late:"):  # the server keeps going and lands the line after the client gave up
+            self.pending.append([subject, fact, args, int(fault.split(":")[1])])
+            raise socket.timeout("timed out")
+        self.land(subject, fact, args)
         if fault == "error_after_write":  # the SQLite limb: the line is written, then the embedder fails
             return FakeResp(rpc({"content": [{"type": "text", "text": "Failed to capture: embedding request failed"}], "isError": True}))
         result = {"content": [{"type": "text", "text": f"Recorded fact {fid} about {subject} (from {args.get('source')}, by open-loops, unconfirmed)"}]}
         if self.mcp_mode == "sse":
-            return FakeResp(sse([{"type": "message", "jsonrpc": "2.0", "id": 1, "result": result}]).replace(b"event: message\n", b"event: message\n"),
-                            headers={"Content-Type": "text/event-stream"})
+            return FakeResp(sse([{"type": "message", "jsonrpc": "2.0", "id": 1, "result": result}]), headers={"Content-Type": "text/event-stream"})
         return FakeResp(rpc(result), headers={"Content-Type": "application/json"})
 
     def anthropic(self, body, url):
         self.model_requests.append(body)
+        for hook in self.model_hooks:
+            hook()
         m = self.model
         if isinstance(m, BaseException):
             raise m
         if isinstance(m, tuple) and m[0] == "http":
             raise http_error(url, m[1], b'{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}')
+        tick = None
+        if self.stream_tick:
+            def tick():
+                self.stream_lines_read += 1
+                self.clock.advance(self.stream_tick)
         if isinstance(m, bytes):
-            return FakeResp(m, headers={"Content-Type": "text/event-stream"})
-        return FakeResp(model_stream(m), headers={"Content-Type": "text/event-stream"})
+            return FakeResp(m, headers={"Content-Type": "text/event-stream"}, on_line=tick)
+        return FakeResp(model_stream(m), headers={"Content-Type": "text/event-stream"}, on_line=tick)
 
     def captures_for(self, key):
         return [c for c in self.captures if c["subject"] == f"loop:{key}"]
+
+    def user_message(self) -> str:
+        return self.model_requests[0]["messages"][0]["content"]
 
 
 class JobCase(unittest.TestCase):
@@ -327,15 +438,25 @@ class JobCase(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.env_path = Path(self.tmp.name) / "job.env"
         self.env_path.write_text(ENV_TEXT, encoding="utf-8")
-        p = mock.patch.object(ol, "now_sast", return_value=NOW)
-        p.start()
-        self.addCleanup(p.stop)
+        self.clock = FakeClock()
+        self.sleeps = []
+        for target, value in ((ol, "now_sast"), ):
+            p = mock.patch.object(target, value, return_value=NOW)
+            p.start()
+            self.addCleanup(p.stop)
+        for name, value in (("monotonic", self.clock), ("sleep", self.sleeps.append)):
+            p = mock.patch.object(ol, name, value)
+            p.start()
+            self.addCleanup(p.stop)
 
     def run_main(self, net, *args, env=True):
+        net.clock = self.clock
         out, err = io.StringIO(), io.StringIO()
         argv = (["--env", str(self.env_path)] if env else []) + list(args)
+        before = signal.getsignal(signal.SIGTERM)
         with mock.patch("urllib.request.urlopen", net), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = ol.main(argv)
+        self.assertIs(signal.getsignal(signal.SIGTERM), before, "main puts the SIGTERM handler back")
         self.assertEqual(net.unexpected, [], "the job called something outside the fakes")
         return code, out.getvalue(), err.getvalue()
 
@@ -360,7 +481,7 @@ W1, W2, W4, P1 = "1563099660288004096", "1563160058265604096", "1564201923379204
 X1, PK = "1559838169497604096", "1560200557363204096"
 
 
-# --- C1: the line ---------------------------------------------------------------------------------------------
+# --- C1: the line, one truth with core/loops.ts ---------------------------------------------------------------
 
 
 class LineFormat(unittest.TestCase):
@@ -372,13 +493,15 @@ class LineFormat(unittest.TestCase):
         "#servest > thread",
         "x" * 500,
         "  spaced\t\tout  ",
-        "uni line sep",
+        "uni\u2028line\u2029sep",
+        "Pay \u202eNOW\u202c later \u2066x\u2069",
+        "lone \ud800 half",
     ]
 
-    def fields(self, title, owner="Kelli", summary="s"):
-        return {"key": "123", "client": "servest", "type": "unanswered_question", "owner": owner, "channel": "servest",
+    def fields(self, title, owner="Kelli", summary="s", client="servest"):
+        return {"key": "123", "client": client, "type": "unanswered_question", "owner": owner, "channel": "servest",
                 "channel_id": SERVEST, "opened": "2026-10-26T08:00:00.000Z", "reopened": None, "title": title,
-                "summary": summary, "evidence": ["5", "3"]}
+                "summary": summary, "evidence": ["3", "5"]}
 
     def test_open_line_is_one_physical_line_and_reads_back_as_sanitised(self):
         for bad in self.HOSTILE:
@@ -390,26 +513,54 @@ class LineFormat(unittest.TestCase):
                 self.assertEqual(tag, "OPEN/1")
                 self.assertEqual(list(f), C1_OPEN_ORDER)
                 self.assertEqual(f["title"], ol.sanitise(bad, 120))
-                self.assertEqual(f["owner"], ol.sanitise(bad))
+                self.assertEqual(f["owner"], ol.sanitise(bad, 100))
                 self.assertEqual(f["summary"], ol.sanitise(bad, 300))
-                self.assertLessEqual(len(f["title"]), 120)
-                self.assertLessEqual(len(f["summary"]), 300)
-                self.assertNotIn("|", f["title"])
+                for name, cap in (("title", 120), ("owner", 100), ("summary", 300)):
+                    self.assertLessEqual(len(f[name]), cap)
+                    self.assertNotIn("|", f[name])
 
-    def test_sanitise_strips_controls_and_pipes_but_keeps_emoji(self):
-        self.assertEqual(ol.sanitise("a|b\nc\x07d  e"), "ab c d e")
-        self.assertEqual(ol.sanitise("🚀 ok"), "🚀 ok")
+    def test_sanitise_follows_core_loops(self):
+        # Expectations derived by hand from core/loops.ts sanitise(): `|` removed; Cc, Cs, U+2028/9 and the bidi
+        # controls turned to spaces; JS whitespace collapsed and trimmed; cut to max code points; no ellipsis.
+        cases = [
+            ("a|b\nc\x07d  e", 300, "ab c d e"),
+            ("Pay \u202eNOW\u202c later", 300, "Pay NOW later"),
+            ("a\u200eb\u200fc\u2066d\u2069e", 300, "a b c d e"),
+            ("lone \ud800 half", 300, "lone half"),
+            ("\ufeffx\u00a0y\u3000z ", 300, "x y z"),
+            ("🚀 ok", 300, "🚀 ok"),
+            ("x" * 130, 120, "x" * 120),
+            ("abc defg", 4, "abc"),  # cut to 4 is "abc ", trimmed again
+        ]
+        for text, cap, want in cases:
+            with self.subTest(text=text[:20]):
+                self.assertEqual(ol.sanitise(text, cap), want)
+
+    def test_ids_and_codes_lose_spaces_commas_pipes_and_controls(self):
+        self.assertEqual(ol.clean_id("servest billing,x"), "servestbillingx")
+        self.assertEqual(ol.clean_id("a\u202eb|c\td"), "abcd")
+        self.assertEqual(len(ol.clean_id("9" * 150)), 100)
+        _, f = parse_line(ol.open_line(self.fields("t", client="servest billing,x")))
+        self.assertEqual(f["client"], "servestbillingx")
+
+    def test_a_5000_character_owner_is_capped_at_100(self):
+        line = ol.open_line(self.fields("t", owner="o" * 5000))
+        self.assertEqual(parse_line(line)[1]["owner"], "o" * 100)
+        self.assertLess(len(line), 700)
 
     def test_reopened_absent_is_a_dash(self):
-        _, f = parse_line(ol.open_line(self.fields("t")))
-        self.assertEqual(f["reopened"], "-")
+        for value in (None, "", "-"):
+            f = self.fields("t")
+            f["reopened"] = value
+            self.assertEqual(parse_line(ol.open_line(f))[1]["reopened"], "-")
 
-    def test_evidence_keeps_the_newest_eight_in_time_order(self):
-        ids = [str(i) for i in (11, 2, 9, 4, 10, 1, 7, 3, 8, 5, 6)]
+    def test_evidence_in_the_line_keeps_the_order_given_and_the_last_eight(self):
         f = self.fields("t")
-        f["evidence"] = ids
-        _, out = parse_line(ol.open_line(f))
-        self.assertEqual(out["evidence"].split(","), ["4", "5", "6", "7", "8", "9", "10", "11"])
+        f["evidence"] = ["11", "2", "9", "4", "2", " 10 ", "1", "7", "3", "8"]  # a repeat of 2, one id with spaces
+        self.assertEqual(parse_line(ol.open_line(f))[1]["evidence"].split(","), ["2", "9", "4", "10", "1", "7", "3", "8"])
+
+    def test_the_job_writes_evidence_in_snowflake_order_newest_eight(self):
+        self.assertEqual(ol.evidence_list(["11", "2", "9", "4", "10", "1", "7", "3", "8", "5", "6", "x"]), ["4", "5", "6", "7", "8", "9", "10", "11"])
 
     def test_closed_line_caps_the_reason(self):
         tag, f = parse_line(ol.closed_line("123", "456", "2026-10-26T08:00:00.000Z", "r|" * 300))
@@ -417,6 +568,26 @@ class LineFormat(unittest.TestCase):
         self.assertEqual(list(f), ["key", "by_message", "closed", "reason"])
         self.assertLessEqual(len(f["reason"]), 200)
         self.assertNotIn("|", f["reason"])
+
+
+class C1Fixture(unittest.TestCase):
+    """Plan v3.1 row 18: one sanitiser truth in two languages. Lane A writes the fixture; this reads the same file.
+    Expected shape: {"cases": [{"field": <C1 field name>, "input": <value>, "expected": <string, or list for evidence>}]}
+    (a bare list of cases is accepted too)."""
+
+    def test_the_job_sanitises_every_field_as_core_loops_does(self):
+        if not C1_FIXTURE.exists():
+            self.skipTest(f"{C1_FIXTURE} is not on this branch yet (lane A writes it, plan v3.1 row 18); re-run when it lands")
+        data = json.loads(C1_FIXTURE.read_text(encoding="utf-8"))
+        cases = data.get("cases") if isinstance(data, dict) else data
+        self.assertTrue(cases, "the fixture holds no cases")
+        for i, case in enumerate(cases):
+            with self.subTest(case=i, field=case.get("field")):
+                got = ol.c1_field(case["field"], case["input"])
+                want = case["expected"]
+                if isinstance(want, str) and isinstance(got, list):
+                    got = ",".join(got)
+                self.assertEqual(got, want)
 
 
 class McpDecode(unittest.TestCase):
@@ -462,9 +633,9 @@ class Closing(unittest.TestCase):
         self.loop = loop_rec(self.key, opened=ago(50))
 
     def close_with(self, reply, *, loop=None, mem=None):
-        plan, msgs = classify(None, [self.opener, reply], loops_reply(loop or self.loop), mem=mem)
+        _, msgs = classify(None, [self.opener, reply], loops_reply(loop or self.loop), mem=mem)
         out = {"existing": [{"key": self.key, "status": "closed_by", "message": mid_of(msgs, reply)}], "new": []}
-        plan, msgs = classify(out, [self.opener, reply], loops_reply(loop or self.loop), mem=mem)
+        plan, _ = classify(out, [self.opener, reply], loops_reply(loop or self.loop), mem=mem)
         return plan
 
     def closes(self, plan):
@@ -472,8 +643,7 @@ class Closing(unittest.TestCase):
 
     def test_member_reply_in_the_same_channel_closes(self):
         reply = thought(ago(10), "Kelli", "Sent it.", author_id=KELLI, in_reply_to=self.opener["metadata"]["source"])
-        plan = self.close_with(reply)
-        [w] = self.closes(plan)
+        [w] = self.closes(self.close_with(reply))
         tag, f = parse_line(w.claim)
         self.assertEqual((tag, f["key"], f["by_message"]), ("CLOSED/1", self.key, msg_id(reply)))
         self.assertEqual(when(f["closed"]), ago(10))
@@ -551,12 +721,7 @@ class Closing(unittest.TestCase):
         self.assertEqual(plan.counts["unknown_key"], 1)
 
 
-# --- C2 keys and generations; C5 updates ---------------------------------------------------------------------
-
-
-def new_item(title, evidence, *, type_="unanswered_question", owner="unclear", channel="servest", client="servest", summary=None):
-    return {"channel": channel, "client": client, "type": type_, "title": title, "summary": summary or f"{title}.",
-            "owner": owner, "evidence": evidence, "why_open": "No reply in the channel."}
+# --- C2 keys and generations (v3.1 rows 1 to 3) ---------------------------------------------------------------
 
 
 class Generations(unittest.TestCase):
@@ -573,80 +738,173 @@ class Generations(unittest.TestCase):
         plan, _ = classify(out, self.thoughts, loops)
         return plan
 
-    def test_rule1_open_key_resighting_adds_evidence_once_and_keeps_reopened(self):
-        lp = loop_rec(self.key, opened=ago(100), reopened=ago(50), evidence=[self.key], line="fact_open")
-        plan = self.run_new(loops_reply(lp), lambda m: new_item("Supervisor for Zola", [m[self.opener["id"]], m[self.later["id"]]]))
+    def both(self, m):
+        return [m[self.opener["id"]], m[self.later["id"]]]
+
+    def test_rule1_an_open_loop_re_reported_by_title_adds_evidence_once_and_keeps_reopened(self):
+        lp = loop_rec(self.key, opened=ago(100), reopened=ago(50), evidence=[self.key], line="fact_open", title="Supervisor access for Zola")
+        plan = self.run_new(loops_reply(lp), lambda m: new_item("supervisor ACCESS for Zola!", self.both(m)))
         [w] = plan.writes
         self.assertEqual((w.kind, w.key, w.supersedes), ("update", self.key, "fact_open"))
         _, f = parse_line(w.claim)
         self.assertEqual(f["evidence"].split(","), [self.key, msg_id(self.later)])
         self.assertEqual(when(f["reopened"]), ago(50))
-        self.assertEqual(f["title"], lp["title"], "a re-sighting keeps the recorded title")
+        self.assertEqual(f["title"], "Supervisor access for Zola", "a re-sighting keeps the recorded title")
+
+    def test_rule1_an_open_loop_re_reported_by_key_with_another_title_attaches(self):
+        lp = loop_rec(self.key, opened=ago(100), evidence=[self.key], title="Supervisor access for Zola")
+        plan = self.run_new(loops_reply(lp), lambda m: new_item("Zola's supervisor rights", self.both(m), key=self.key))
+        self.assertEqual([(w.kind, w.key) for w in plan.writes], [("update", self.key)])
 
     def test_rule1_resighting_with_nothing_new_writes_nothing(self):
-        lp = loop_rec(self.key, opened=ago(100), evidence=[self.key, msg_id(self.later)])
-        plan = self.run_new(loops_reply(lp), lambda m: new_item("Supervisor for Zola", [m[self.opener["id"]], m[self.later["id"]]]))
+        lp = loop_rec(self.key, opened=ago(100), evidence=[self.key, msg_id(self.later)], title="Supervisor access for Zola")
+        plan = self.run_new(loops_reply(lp), lambda m: new_item("Supervisor access for Zola", self.both(m)))
         self.assertEqual(plan.writes, [])
 
     def test_rule1_parked_resighting_writes_nothing(self):
-        lp = loop_rec(self.key, opened=ago(100), state="parked")
-        plan = self.run_new(loops_reply(lp), lambda m: new_item("Supervisor for Zola", [m[self.opener["id"]], m[self.later["id"]]]))
+        lp = loop_rec(self.key, opened=ago(100), state="parked", title="Supervisor access for Zola")
+        plan = self.run_new(loops_reply(lp), lambda m: new_item("Supervisor access for Zola", self.both(m)))
         self.assertEqual(plan.writes, [])
         self.assertEqual(plan.counts["resighted_parked"], 1)
 
-    def test_rule2_all_cited_before_the_close_is_suppressed_and_counted(self):
-        lp = loop_rec(self.key, opened=ago(100), state="closed", closed=ago(10))
-        plan = self.run_new(loops_reply(lp), lambda m: new_item("Supervisor for Zola", [m[self.opener["id"]], m[self.later["id"]]]))
-        self.assertEqual(plan.writes, [])
-        self.assertEqual(plan.counts["resighted_closed"], 1)
+    def test_s1_a_re_reported_open_loop_beside_a_new_ask_on_the_same_opener(self):
+        """Review row 1, S1: the new ask must be recorded, the open loop must not be duplicated as :b."""
+        lp = loop_rec(self.key, opened=ago(100), evidence=[self.key], title="Zebra: confirm the KZN list", line="fact_z")
+        plan = self.run_new(loops_reply(lp),
+                            lambda m: new_item("Zebra: confirm the KZN list", [m[self.opener["id"]]]),
+                            lambda m: new_item("Apple: send the Swanzo export", self.both(m)))
+        got = writes_of(plan)
+        self.assertEqual(list(got), [("open", f"{self.key}:b")])
+        self.assertEqual(got[("open", f"{self.key}:b")]["title"], "Apple: send the Swanzo export")
 
-    def test_rule2_a_later_message_opens_generation_two_from_the_new_ask(self):
-        lp = loop_rec(self.key, opened=ago(100), state="closed", closed=ago(50))
-        plan = self.run_new(loops_reply(lp), lambda m: new_item("Reports role for Zola", [m[self.opener["id"]], m[self.later["id"]]]))
+    def test_fresh_letters_skip_the_ones_the_family_already_uses(self):
+        g1 = loop_rec(self.key, opened=ago(100), title="Zebra: confirm the KZN list")
+        gb = loop_rec(f"{self.key}:b", opened=ago(100), title="Mango: book the site visit")
+        plan = self.run_new(loops_reply(g1, gb),
+                            lambda m: new_item("Apple: send the Swanzo export", self.both(m)),
+                            lambda m: new_item("Banana: renew the licence", self.both(m)))
+        self.assertEqual(sorted(w.key for w in plan.writes), [f"{self.key}:c", f"{self.key}:d"])
+
+    def test_s2_a_second_ask_on_a_resolved_opener_is_recorded_not_suppressed(self):
+        """Review row 2, S2: suppression compares what is owed, not only times."""
+        lp = loop_rec(self.key, opened=ago(100), state="resolved", closed=ago(48), learned=ago(48), title="Confirm the KZN list")
+        plan = self.run_new(loops_reply(lp), lambda m: new_item("Send the Swanzo export", [m[self.opener["id"]]]))
+        self.assertEqual([(w.kind, w.key) for w in plan.writes], [("open", f"{self.key}:b")])
+        self.assertEqual(plan.counts["resighted_closed"], 0)
+
+    def test_rule2_an_attached_item_with_only_old_messages_is_suppressed_and_counted(self):
+        for attach in ("key", "title"):
+            with self.subTest(attach=attach):
+                lp = loop_rec(self.key, opened=ago(100), state="closed", closed=ago(10), title="Supervisor access for Zola")
+                plan = self.run_new(loops_reply(lp), lambda m: new_item("Supervisor access for Zola" if attach == "title" else "Something else",
+                                                                         self.both(m), key=self.key if attach == "key" else None))
+                self.assertEqual(plan.writes, [])
+                self.assertEqual(plan.counts["resighted_closed"], 1)
+
+    def test_rule2_suppression_compares_the_items_own_key_not_a_finished_sibling(self):
+        closed_b = loop_rec(f"{self.key}:b", opened=ago(100), state="closed", closed=ago(5), title="Supervisor access for Zola")
+        plan = self.run_new(loops_reply(closed_b), lambda m: new_item("Reports role for Zola", self.both(m)))
+        self.assertEqual([w.key for w in plan.writes], [self.key], "an unattached item on a fresh letter is never suppressed by a sibling")
+
+    def test_rule2_an_attached_item_with_a_later_message_opens_generation_two_from_the_new_ask(self):
+        lp = loop_rec(self.key, opened=ago(100), state="closed", closed=ago(50), title="Reports role for Zola")
+        plan = self.run_new(loops_reply(lp), lambda m: new_item("Reports role for Zola", self.both(m)))
         [w] = plan.writes
         self.assertEqual((w.kind, w.key, w.supersedes), ("open", f"{self.key}:2", None))
         _, f = parse_line(w.claim)
-        self.assertEqual(f["key"], f"{self.key}:2")
         self.assertEqual(when(f["opened"]), ago(20), "generation 2 opens at the new ask, so the old closing reply cannot close it")
 
     def test_rule2_generation_three_when_two_is_finished(self):
-        g1 = loop_rec(self.key, opened=ago(100), state="closed", closed=ago(90))
-        g2 = loop_rec(f"{self.key}:2", opened=ago(80), state="resolved", closed=ago(40))
-        plan = self.run_new(loops_reply(g1, g2), lambda m: new_item("Reports role for Zola", [m[self.opener["id"]], m[self.later["id"]]]))
+        g1 = loop_rec(self.key, opened=ago(100), state="closed", closed=ago(90), title="Reports role for Zola")
+        g2 = loop_rec(f"{self.key}:2", opened=ago(80), state="resolved", closed=ago(40), learned=ago(40), title="Reports role for Zola")
+        plan = self.run_new(loops_reply(g1, g2), lambda m: new_item("Reports role for Zola", self.both(m), key=self.key))
         self.assertEqual([w.key for w in plan.writes], [f"{self.key}:3"])
 
-    def test_rule2_resolved_without_a_closed_time_uses_when_it_was_written(self):
-        lp = loop_rec(self.key, opened=ago(100), state="resolved", learned=ago(10))
-        plan = self.run_new(loops_reply(lp), lambda m: new_item("Supervisor for Zola", [m[self.opener["id"]], m[self.later["id"]]]))
+    def test_row17_a_resolve_claiming_a_future_time_is_read_at_when_it_was_learned(self):
+        lp = loop_rec(self.key, opened=ago(100), state="resolved", closed=datetime(2099, 1, 1, tzinfo=UTC), learned=ago(30),
+                      title="Reports role for Zola")
+        plan = self.run_new(loops_reply(lp), lambda m: new_item("Reports role for Zola", self.both(m)))
+        self.assertEqual([w.key for w in plan.writes], [f"{self.key}:2"], "the message 20 h ago is later than the resolve learned 30 h ago")
+
+    def test_a_closed_loop_keeps_its_message_time_even_if_learned_later(self):
+        lp = loop_rec(self.key, opened=ago(100), state="closed", closed=ago(10), learned=ago(1), title="Reports role for Zola")
+        plan = self.run_new(loops_reply(lp), lambda m: new_item("Reports role for Zola", self.both(m)))
         self.assertEqual(plan.writes, [])
-        self.assertEqual(plan.counts["resighted_closed"], 1)
 
     def test_rule3_two_asks_in_one_message_get_b_in_title_order(self):
         plan = self.run_new(loops_reply(),
                             lambda m: new_item("Supervisor access for Zola", [m[self.opener["id"]]]),
-                            lambda m: new_item("Reports role for Zola", [m[self.opener["id"]], m[self.later["id"]]]))
+                            lambda m: new_item("Reports role for Zola", self.both(m)))
         got = {w.key: parse_line(w.claim)[1]["title"] for w in plan.writes}
         self.assertEqual(got, {self.key: "Reports role for Zola", f"{self.key}:b": "Supervisor access for Zola"})
 
-    def test_resighting_and_a_new_ask_on_one_closed_opener_do_not_make_a_b_loop(self):
-        lp = loop_rec(self.key, opened=ago(100), state="closed", closed=ago(50))
-        plan = self.run_new(loops_reply(lp),
-                            lambda m: new_item("Supervisor access for Zola", [m[self.opener["id"]]]),
-                            lambda m: new_item("Reports role for Zola", [m[self.opener["id"]], m[self.later["id"]]]))
-        self.assertEqual([w.key for w in plan.writes], [f"{self.key}:2"])
-        self.assertEqual(plan.counts["resighted_closed"], 1)
+    def test_two_items_with_one_title_make_one_loop_with_both_evidence(self):
+        # Only the first in title order cites the later message: losing either item's evidence shows.
+        plan = self.run_new(loops_reply(),
+                            lambda m: new_item("Reports role for zola.", [m[self.opener["id"]]]),
+                            lambda m: new_item("Reports role for Zola", [m[self.later["id"]], m[self.opener["id"]]]))
+        [w] = plan.writes
+        _, f = parse_line(w.claim)
+        self.assertEqual(f["evidence"].split(","), [self.key, msg_id(self.later)])
+        self.assertEqual(f["title"], "Reports role for Zola", "the first in title order names the loop")
 
-    def test_unreadable_line_on_the_subject_blocks_the_write(self):
+    def test_unreadable_line_on_the_opener_blocks_its_new_loops(self):
         plan = self.run_new(loops_reply(unreadable=[{"subject": f"loop:{self.key}", "lineId": "fact_bad"}]),
                             lambda m: new_item("Supervisor for Zola", [m[self.opener["id"]]]))
         self.assertEqual(plan.writes, [])
         self.assertEqual(plan.counts["unreadable_conflict"], 1)
+
+    def test_an_unknown_key_on_a_new_item_is_counted_and_ignored(self):
+        plan = self.run_new(loops_reply(), lambda m: new_item("Reports role for Zola", self.both(m), key="1234567890123456789"))
+        self.assertEqual([w.key for w in plan.writes], [self.key])
+        self.assertEqual(plan.counts["unknown_key_new"], 1)
 
     def test_opener_is_the_oldest_cited_message_not_the_first_listed(self):
         plan = self.run_new(loops_reply(), lambda m: new_item("Reports role for Zola", [m[self.later["id"]], m[self.opener["id"]]]))
         [w] = plan.writes
         self.assertEqual(w.key, self.key)
         self.assertEqual(w.source, self.opener["metadata"]["source"])
+
+
+class Channels(unittest.TestCase):
+    def test_s3_evidence_from_another_channel_is_dropped_and_the_named_channel_decides(self):
+        """Review row 3, S3: an older context message in #billing must not make it a billing loop."""
+        context = thought(ago(80), "Charne", "context: billing run is Friday", channel="billing", chan_id=BILLING, author_id=KELLI)
+        ask = thought(ago(30), "Thabo", "Can someone fix the Servest export?", author_id=THABO)
+        ts = [context, ask]
+        _, msgs = classify(None, ts, loops_reply())
+        out = {"existing": [], "new": [new_item("Fix the Servest export", [mid_of(msgs, context), mid_of(msgs, ask)])]}
+        plan, _ = classify(out, ts, loops_reply())
+        [w] = plan.writes
+        _, f = parse_line(w.claim)
+        self.assertEqual((w.key, f["channel"], f["channel_id"], f["client"], f["evidence"]), (msg_id(ask), "servest", SERVEST, "servest", msg_id(ask)))
+        self.assertEqual(plan.counts["cross_channel"], 1)
+
+    def test_an_item_with_no_evidence_in_its_named_channel_is_dropped(self):
+        t = thought(ago(30), "Lerato", "Export fails.", channel="swanzo", chan_id=SWANZO, author_id=LERATO)
+        _, msgs = classify(None, [t], loops_reply())
+        out = {"existing": [], "new": [new_item("Export", [mid_of(msgs, t)], channel="servest")]}
+        plan, _ = classify(out, [t], loops_reply())
+        self.assertEqual(plan.writes, [])
+        self.assertEqual((plan.counts["cross_channel"], plan.counts["bad_channel"]), (1, 1))
+
+    def test_evidence_add_from_another_channel_is_dropped(self):
+        opener = thought(ago(80), "Thabo", "Export fails.", author_id=THABO)
+        elsewhere = thought(ago(10), "Lerato", "Same here.", channel="swanzo", chan_id=SWANZO, author_id=LERATO)
+        lp = loop_rec(msg_id(opener), opened=ago(80))
+        _, msgs = classify(None, [opener, elsewhere], loops_reply(lp))
+        out = {"existing": [{"key": lp["key"], "status": "evidence_add", "evidence": [mid_of(msgs, elsewhere)]}], "new": []}
+        plan, _ = classify(out, [opener, elsewhere], loops_reply(lp))
+        self.assertEqual(plan.writes, [])
+        self.assertEqual(plan.counts["cross_channel"], 1)
+
+    def test_a_thread_message_counts_as_its_parent_channel(self):
+        ask = thought(ago(30), "Thabo", "In a thread.", chan_id=THREAD, parent_id=SERVEST, author_id=THABO)
+        _, msgs = classify(None, [ask], loops_reply())
+        out = {"existing": [], "new": [new_item("Thread ask", [mid_of(msgs, ask)])]}
+        plan, _ = classify(out, [ask], loops_reply())
+        _, f = parse_line(plan.writes[0].claim)
+        self.assertEqual((f["channel"], f["channel_id"], f["client"]), ("servest", SERVEST, "servest"), "a thread loop keys on its parent channel")
 
 
 class NewLoops(unittest.TestCase):
@@ -671,23 +929,29 @@ class NewLoops(unittest.TestCase):
         self.assertEqual([w.key for w in plan.writes], [msg_id(old)])
         self.assertEqual((plan.counts["bad_id"], plan.counts["on_portal"], plan.counts["too_young"], plan.counts["bad_type"]), (2, 1, 2, 1))
 
-    def test_channel_and_client_come_from_the_opener_and_the_mapping(self):
+    def test_client_comes_from_the_mapping_over_the_model(self):
         t = thought(ago(30), "Lerato", "Export fails.", channel="swanzo", chan_id=SWANZO, author_id=LERATO)
         i = thought(ago(30), "Devon", "I'll write the notes.", channel="dev-internal", chan_id=INTERNAL, author_id=DEVON)
-        th = thought(ago(30), "Thabo", "In a thread.", chan_id=THREAD, parent_id=SERVEST, author_id=THABO)
-        ts = [t, i, th]
+        ts = [t, i]
         _, msgs = classify(None, ts, loops_reply())
-        m = {x["id"]: mid_of(msgs, x) for x in ts}
         out = {"existing": [], "new": [
-            new_item("Export", [m[t["id"]]], channel="servest", client="servest"),      # the model names the wrong channel and client
-            new_item("Notes", [m[i["id"]]], type_="unkept_promise", channel="dev-internal", client="madeup"),
-            new_item("Thread ask", [m[th["id"]]], channel="servest", client=None),
+            new_item("Export", [mid_of(msgs, t)], channel="swanzo", client="servest"),
+            new_item("Notes", [mid_of(msgs, i)], type_="unkept_promise", channel="dev-internal", client="madeup"),
         ]}
         plan, _ = classify(out, ts, loops_reply())
         got = {w.key: parse_line(w.claim)[1] for w in plan.writes}
         self.assertEqual((got[msg_id(t)]["channel"], got[msg_id(t)]["channel_id"], got[msg_id(t)]["client"]), ("swanzo", SWANZO, "swanzo"))
         self.assertEqual(got[msg_id(i)]["client"], "internal")
-        self.assertEqual((got[msg_id(th)]["channel_id"], got[msg_id(th)]["client"]), (SERVEST, "servest"), "a thread loop keys on its parent channel")
+
+    def test_row4_a_mixed_channel_loop_naming_a_known_client_gets_that_client(self):
+        t = thought(ago(30), "Thabo", "Servest portal is down for all supervisors.", channel="urgent_support", chan_id=URGENT, author_id=THABO)
+        _, msgs = classify(None, [t], loops_reply())
+        out = {"existing": [], "new": [new_item("Servest portal outage", [mid_of(msgs, t)], channel="urgent_support", client="servest")]}
+        plan, _ = classify(out, [t], loops_reply(), clients={"servest", "swanzo", "lungile"})
+        self.assertEqual(parse_line(plan.writes[0].claim)[1]["client"], "servest")
+        out["new"][0]["client"] = "client:lungile"
+        plan, _ = classify(out, [t], loops_reply(), clients={"servest", "swanzo", "lungile"})
+        self.assertEqual(parse_line(plan.writes[0].claim)[1]["client"], "lungile", "a client with no mapped channel is still on the list")
 
     def test_message_ids_never_leak_into_title_or_summary(self):
         t = thought(ago(30), "Thabo", "Export fails.", author_id=THABO)
@@ -740,7 +1004,7 @@ class Updates(unittest.TestCase):
     def test_one_line_per_loop_per_run_and_a_close_wins(self):
         reply = thought(ago(5), "Kelli", "Fixed.", author_id=KELLI)
         ts = [self.opener, self.nudge, reply]
-        lp = loop_rec(self.key, opened=ago(80), owner="Kelli")
+        lp = loop_rec(self.key, opened=ago(80), owner="Kelli", title="Export again")
         _, msgs = classify(None, ts, loops_reply(lp))
         m = {t["id"]: mid_of(msgs, t) for t in ts}
         out = {"existing": [
@@ -779,13 +1043,11 @@ class RecordedTranscript(unittest.TestCase):
             S1: "Bellville site added to the portal",
             f"{S1}:b": "September incident report for Servest",
             D1: "APIM routing notes for the team",
-            f"{W0}:2": "Reports role for Zola",
+            f"{W0}:b": "Reports role for Zola",  # a different thing owed on W0's opener: a fresh letter, not W0's generation
         })
         self.assertEqual([w.key for w in plan.writes if w.kind == "close"], [W1])
         self.assertEqual([w for w in plan.writes if w.kind == "update"], [], "owner from unclear is ignored")
-        self.assertEqual((plan.counts["resighted_closed"], plan.counts["on_portal"]), (1, 1))
-        w0_2 = next(w for w in plan.writes if w.key == f"{W0}:2")
-        self.assertEqual(when(parse_line(w0_2.claim)[1]["opened"]), datetime(2026, 10, 26, 11, 0, tzinfo=SAST))
+        self.assertEqual((plan.counts["resighted_closed"], plan.counts["on_portal"]), (1, 1), "the Supervisor item attaches to W0 by key")
         self.assertEqual(parse_line(next(w for w in plan.writes if w.key == D1).claim)[1]["client"], "internal")
 
 
@@ -799,19 +1061,23 @@ class Run(JobCase):
         self.assertEqual(code, 0)
         self.assertEqual(net.captures, [])
         self.assertEqual(net.posts, [])
-        self.assertEqual([c["url"] for c in net.calls if c["method"] != "GET"], ["https://api.anthropic.com/v1/messages"])
+        self.assertEqual([c["url"] for c in net.calls if c["method"] != "GET"], [ANTHROPIC])
         self.assertIn("would open 4, close 1, update 0", out)
+        self.assertIn("Bellville site added to the portal", out, "the dry run prints the post it would make")
 
-    def test_post_writes_one_line_per_transition_then_posts(self):
+    def test_post_writes_one_line_per_transition_then_posts_from_a_fresh_read(self):
         net = fixture_net()
         code, out, err = self.run_main(net, "--post")
-        self.assertEqual(code, 0, err)
-        self.assertEqual(sorted(c["subject"] for c in net.captures),
-                         sorted(f"loop:{k}" for k in (S1, f"{S1}:b", D1, f"{W0}:2", W1)))
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(sorted(c["subject"] for c in net.captures), sorted(f"loop:{k}" for k in (S1, f"{S1}:b", D1, f"{W0}:b", W1)))
         [close] = net.captures_for(W1)
         self.assertEqual(close["supersedes"], "fact_w1")
         self.assertTrue(close["content"].startswith("CLOSED/1 | key=" + W1))
         self.assertTrue(all(c.get("occurred_at") for c in net.captures))
+        loops_at = [i for i, c in enumerate(net.calls) if "/browse/api/loops" in c["url"]]
+        mcp_at = [i for i, c in enumerate(net.calls) if c["url"] == BASE + "/mcp"]
+        self.assertGreaterEqual(len(loops_at), 2, "/loops is read again after the writes")
+        self.assertGreater(loops_at[-1], mcp_at[-1])
         text = self.posted(net)
         for title in ("Bellville site added to the portal", "September incident report for Servest", "Reports role for Zola",
                       "APIM routing notes for the team", "Site list export for Servest"):
@@ -824,33 +1090,36 @@ class Run(JobCase):
         self.assertTrue(all(p["allowed_mentions"] == {"parse": []} for p in net.posts))
         self.assertTrue(all(len(p["content"]) <= 2000 for p in net.posts))
 
+    def test_the_model_sees_finished_loops_whose_opener_is_in_the_window_and_the_client_list(self):
+        net = fixture_net()
+        net.records["1000000000000000001"] = loop_rec("1000000000000000001", opened=ago(900), state="closed", closed=ago(800), title="Ancient thing")
+        self.run_main(net)
+        user = net.user_message()
+        finished = user.split("Loops already finished")[1].split("Messages")[0]
+        self.assertIn(f"key {W0}", finished)
+        self.assertIn("Supervisor access for Zola", finished)
+        self.assertNotIn("1000000000000000001", user, "a finished loop whose opener is outside the window is not shown")
+        self.assertNotIn(f"key {W1}", finished, "an open loop is listed with the open ones")
+        self.assertRegex(user, r"Clients: .*servest.*swanzo")
+
     def test_newest_loops_come_first(self):
         net = fixture_net()
         self.run_main(net, "--post")
         text = self.posted(net)
-        self.assertLess(text.index("Reports role for Zola"), text.index("APIM routing notes"))
-        self.assertLess(text.index("APIM routing notes"), text.index("Site list export for Servest"))
+        self.assertLess(text.index("September incident report"), text.index("APIM routing notes"))
+        self.assertLess(text.index("APIM routing notes"), text.index("Reports role for Zola"))
+        self.assertLess(text.index("Reports role for Zola"), text.index("Site list export for Servest"))
 
     def test_every_call_has_a_timeout_and_the_model_streams(self):
         net = fixture_net()
         self.run_main(net, "--post")
-        model = [c for c in net.calls if c["url"] == "https://api.anthropic.com/v1/messages"]
-        others = [c for c in net.calls if c["url"] != "https://api.anthropic.com/v1/messages"]
+        model = [c for c in net.calls if c["url"] == ANTHROPIC]
+        others = [c for c in net.calls if c["url"] != ANTHROPIC]
         self.assertTrue(others)
         self.assertEqual({c["timeout"] for c in others}, {30})
         self.assertEqual(len(model), 1)
         self.assertTrue(net.model_requests[0]["stream"], "only a streamed call can live with a silence timeout")
-        self.assertIsNotNone(model[0]["timeout"])
         self.assertLessEqual(model[0]["timeout"], 180)
-
-    def test_a_reworded_or_foreign_confirmation_is_not_taken_as_written(self):
-        for reply in ("Captured as observation", f"Recorded fact fact_9 about loop:{W1}:2 (from x)", "Recorded fact fact_9 about loop:999 (from x)"):
-            with self.subTest(reply=reply):
-                g = ol.Grysstof(BASE + "/mcp", "k")
-                w = ol.Write("close", W1, "CLOSED/1 | key=" + W1, "fact_w1", "s", "p", "2026-10-26T08:00:00.000Z", {})
-                with mock.patch.object(ol, "http_text", return_value=(rpc({"content": [{"type": "text", "text": reply}]}).decode(), None)):
-                    with self.assertRaises(ol.JobError):
-                        g.capture(w)
 
     def test_grysstof_calls_carry_the_key_and_the_actor(self):
         net = fixture_net()
@@ -866,38 +1135,96 @@ class Run(JobCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(net.captures), 5)
 
+    def test_a_reworded_or_foreign_confirmation_is_not_taken_as_written(self):
+        for reply in ("Captured as observation", f"Recorded fact fact_9 about loop:{W1}:2 (from x)", "Recorded fact fact_9 about loop:999 (from x)"):
+            with self.subTest(reply=reply):
+                g = ol.Grysstof(BASE + "/mcp", "k")
+                w = ol.Write("close", W1, "CLOSED/1 | key=" + W1, "fact_w1", "s", "p", "2026-10-26T08:00:00.000Z", {})
+                with mock.patch.object(ol, "http_text", return_value=(rpc({"content": [{"type": "text", "text": reply}]}).decode(), None)):
+                    with self.assertRaises(ol.JobError):
+                        g.capture(w)
+
+    # --- row 5: writes and their failures
+
     def test_error_after_the_line_exists_rereads_and_does_not_write_twice(self):
         net = fixture_net()
-        net.mcp_faults = ["error_after_write"]  # the first write lands, then the reply is an error
+        net.mcp_faults = ["error_after_write"]  # the first write (the close) lands, then the reply is an error
         code, out, err = self.run_main(net, "--post")
         self.assertEqual(code, 0, out + err)
         self.assertEqual(len(net.captures), 5, "no second write for the line that already landed")
         self.assertIn("landed", out + err)
 
-    def test_error_before_the_write_is_retried_once(self):
+    def test_a_superseding_write_that_failed_cleanly_is_retried_once(self):
         net = fixture_net()
-        net.mcp_faults = ["error_before_write"]
+        net.mcp_faults = ["error_before_write"]  # the close (it has supersedes) fails without writing
         code, out, err = self.run_main(net, "--post")
         self.assertEqual(code, 0, out + err)
-        self.assertEqual(len(net.captures), 6)
+        self.assertEqual(len(net.captures_for(W1)), 2)
 
-    def test_two_failures_on_one_write_give_up_and_exit_nonzero(self):
+    def test_a_new_loop_write_is_never_retried(self):
         net = fixture_net()
-        net.mcp_faults = ["error_before_write", "timeout"]
+        net.mcp_faults = [None, "error_before_write"]  # the close goes through; the first new open fails without writing
         code, out, err = self.run_main(net, "--post")
         self.assertNotEqual(code, 0)
-        self.assertEqual(len(net.captures), 6)
+        self.assertEqual(len(net.captures), 5, "the failed new open is not sent again")
         self.assertIn("1 ledger write failed", self.posted(net))
 
-    def test_a_loop_changed_by_someone_else_is_not_overwritten(self):
+    def test_a_timed_out_write_that_lands_late_is_found_on_the_one_re_read(self):
         net = fixture_net()
-        # Kelli resolved W1 after the job read /loops: its head is no longer fact_w1.
-        net.ledger[f"loop:{W1}"] = [{"id": "fact_kelli", "subject": f"loop:{W1}", "claim": f"RESOLVED/1 | key={W1}", "supersedes": "fact_w1"},
-                                    {"id": "fact_w1", "subject": f"loop:{W1}", "claim": f"OPEN/1 | key={W1}", "supersededBy": "fact_kelli"}]
+        net.mcp_faults = [None, "timeout_late:0"]  # the server lands the new open before the job's re-read
+        code, out, err = self.run_main(net, "--post")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len(net.captures), 5)
+        self.assertTrue(self.sleeps, "the job pauses before its re-read")
+        self.assertIn("landed", out + err)
+
+    def test_a_timed_out_write_still_missing_after_the_re_read_is_unknown_and_never_forked(self):
+        net = fixture_net()
+        net.mcp_faults = [None, "timeout_late:5"]  # it lands only after the job has looked
         code, out, err = self.run_main(net, "--post")
         self.assertNotEqual(code, 0)
+        self.assertEqual(len(net.captures), 5, "a timed-out write is not sent again")
+        self.assertIn("unknown", (out + err).lower())
+        self.assertIn("unknown", self.posted(net).lower())
+        timed_out = net.captures[1]["subject"]
+        net.flush_pending()
+        self.assertEqual(len([f for f in net.ledger[timed_out] if not f.get("supersededBy")]), 1, "one head: no fork")
+
+    def test_a_timed_out_superseding_write_is_not_retried_either(self):
+        net = fixture_net()
+        net.mcp_faults = ["timeout"]  # the close dies on the wire
+        code, out, err = self.run_main(net, "--post")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(len(net.captures_for(W1)), 1)
+        self.assertIn("unknown", (out + err).lower())
+
+    # --- row 7: a fresh read for the post; a conflict is not a failure
+
+    def test_a_loop_resolved_during_the_run_is_a_conflict_not_a_failure(self):
+        net = fixture_net()
+
+        def kelli_resolves():  # while the model thinks, Kelli presses Resolve on W1
+            net.ledger[f"loop:{W1}"] = [{"id": "fact_kelli", "subject": f"loop:{W1}", "claim": f"RESOLVED/1 | key={W1}", "supersedes": "fact_w1"},
+                                        {"id": "fact_w1", "subject": f"loop:{W1}", "claim": f"OPEN/1 | key={W1}", "supersededBy": "fact_kelli"}]
+            net.records[W1].update({"state": "resolved", "lineId": "fact_kelli", "closed": iso(NOW), "learnedAt": iso(NOW)})
+
+        net.model_hooks.append(kelli_resolves)
+        code, out, err = self.run_main(net, "--post")
+        self.assertEqual(code, 0, out + err)
         self.assertEqual(len(net.captures_for(W1)), 1, "a stale supersedes is not retried")
-        self.assertIn("changed", (out + err).lower())
+        text = self.posted(net)
+        self.assertNotIn("6498 export fails on large sites", text.split("Closed in channel")[0], "the fresh read shows it resolved")
+        self.assertIn("1 loop changed by someone else during the run", text)
+        self.assertNotIn("write failed", text)
+
+    def test_a_loop_parked_during_the_run_is_left_out_of_the_post(self):
+        net = fixture_net()
+        net.model_hooks.append(lambda: net.records[X1].update({"state": "parked", "until": "2026-11-09", "lineId": "fact_park"}))
+        code, _, _ = self.run_main(net, "--post")
+        self.assertEqual(code, 0)
+        self.assertNotIn("Site list export for Servest", self.posted(net))
+
+    # --- the model
 
     def test_model_failure_posts_the_recorded_list_under_a_stale_header(self):
         failures = {
@@ -905,11 +1232,11 @@ class Run(JobCase):
             "timeout": socket.timeout("timed out"),
             "stream error": sse([{"type": "message_start", "message": {"usage": {"input_tokens": 5}}},
                                  {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}]),
-            "refusal": model_stream('{"existing": [], "new": []}', stop="refusal"),
+            "refusal": model_stream(EMPTY_ANSWER, stop="refusal"),
             "cut off": model_stream('{"existing": [], "new": [', stop="max_tokens"),
             "no json": "I could not find any loops.",
             "stream ends early": sse([{"type": "message_start", "message": {"usage": {"input_tokens": 5}}},
-                                      {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": '{"existing": [], "new": []}'}}]),
+                                      {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": EMPTY_ANSWER}}]),
         }
         for name, model in failures.items():
             with self.subTest(name):
@@ -928,6 +1255,7 @@ class Run(JobCase):
             with self.subTest(post=post):
                 net = fixture_net()
                 net.model = ("http", 401)
+                net.clock = self.clock
                 out_raw, err_raw = io.BytesIO(), io.BytesIO()
                 out = io.TextIOWrapper(out_raw, encoding="cp1252", errors="strict")
                 err = io.TextIOWrapper(err_raw, encoding="cp1252", errors="strict")
@@ -940,7 +1268,6 @@ class Run(JobCase):
                 self.assertEqual(net.unexpected, [])
                 self.assertNotEqual(code, 0)
                 self.assertIn("model.failed", printed)
-                self.assertNotIn("UnicodeEncodeError", printed)
                 if post:
                     self.assertIn("⚠", self.posted(net), "Discord still gets the marks")
                     self.assertIn("model pass failed; list may be stale", self.posted(net))
@@ -954,6 +1281,98 @@ class Run(JobCase):
         self.assertNotEqual(code, 0)
         self.assertEqual((net.posts, net.captures), ([], []))
         self.assertIn("model pass failed; list may be stale", out)
+
+    def test_row28_the_model_sits_behind_one_ask_function_chosen_by_env(self):
+        seen = []
+
+        def fake_provider(env):
+            def ask(system, user):
+                seen.append((system, user))
+                return EMPTY_ANSWER
+            return ask
+
+        self.env_path.write_text(ENV_TEXT.replace("ANTHROPIC_API_KEY=test-anthropic\n", "") + "OPEN_LOOPS_MODEL_PROVIDER=fake\n", encoding="utf-8")
+        net = fixture_net()
+        with mock.patch.dict(ol.PROVIDERS, {"fake": fake_provider}):
+            code, out, err = self.run_main(net)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(net.model_requests, [], "no Anthropic call when another provider is chosen")
+        [(system, user)] = seen
+        self.assertEqual(system, ol.SYSTEM)
+        self.assertIn("[m1]", user)
+
+    def test_an_unknown_provider_fails_in_one_line_before_any_call(self):
+        self.env_path.write_text(ENV_TEXT + "OPEN_LOOPS_MODEL_PROVIDER=nope\n", encoding="utf-8")
+        net = fixture_net()
+        code, _, err = self.run_main(net)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(net.calls, [])
+        self.assertIn("nope", err)
+
+    # --- row 6: SIGTERM and the deadline
+
+    def test_sigterm_during_the_model_call_runs_the_failure_path(self):
+        net = fixture_net()
+        net.model_hooks.append(lambda: signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None))
+        code, out, err = self.run_main(net, "--post")
+        self.assertEqual(code, 1)
+        self.assertEqual(net.captures, [])
+        self.assertEqual(len(net.posts), 1)
+        self.assertIn("Open loops job failed", net.posts[0]["content"])
+        self.assertIn("SIGTERM", net.posts[0]["content"])
+
+    def test_sigterm_during_the_writes_stops_them_and_says_so(self):
+        net = fixture_net()
+        net.mcp_faults = [None, "sigterm"]
+        code, out, err = self.run_main(net, "--post")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(net.captures), 2, "nothing is written after the signal")
+        self.assertIn("SIGTERM", self.posted(net))
+
+    def test_a_model_pass_that_runs_past_the_deadline_falls_back_to_the_stale_post(self):
+        net = fixture_net()
+        net.model_hooks.append(lambda: self.clock.advance(ol.DEADLINE_SECONDS + 5))
+        code, out, err = self.run_main(net, "--post")
+        self.assertEqual(code, 1)
+        self.assertEqual(net.captures, [])
+        self.assertIn("model pass failed; list may be stale", self.posted(net))
+
+    def test_a_slow_stream_is_abandoned_at_the_deadline_not_read_to_the_end(self):
+        net = fixture_net()
+        net.model = EMPTY_ANSWER + " " * 4000  # about 110 text deltas, some 350 lines
+        net.stream_tick = 10                   # ten seconds a line: the 780 s run out after about 78 lines
+        code, out, err = self.run_main(net, "--post")
+        self.assertEqual(code, 1)
+        self.assertLess(net.stream_lines_read, 100, "the job stops reading at the deadline")
+        self.assertEqual(net.captures, [])
+        self.assertIn("model pass failed; list may be stale", self.posted(net))
+
+    def test_the_model_call_never_waits_past_the_deadline(self):
+        net = fixture_net()
+        start = self.clock.t  # the run's deadline starts here
+        original = net.browse
+
+        def slow_loops(route, q):
+            if route == "/loops" and not net.model_requests:
+                self.clock.t = start + ol.DEADLINE_SECONDS - 50  # the reads took all but 50 s
+            return original(route, q)
+
+        net.browse = slow_loops
+        self.run_main(net)
+        [model] = [c for c in net.calls if c["url"] == ANTHROPIC]
+        self.assertLessEqual(model["timeout"], 50)
+
+    def test_writes_stop_at_the_deadline_and_the_rest_are_counted(self):
+        net = fixture_net()
+        net.mcp_faults = [f"advance:{ol.DEADLINE_SECONDS}"]  # the first write takes the rest of the time
+        code, out, err = self.run_main(net, "--post")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(net.captures), 1)
+        text = self.posted(net)
+        self.assertIn("4 ledger writes not made", text)
+        self.assertIn("Site list export for Servest", text, "the post still goes out, from a fresh read")
+
+    # --- reads
 
     def test_grysstof_down_posts_one_failure_line(self):
         net = fixture_net()
@@ -976,60 +1395,82 @@ class Run(JobCase):
 
     def test_window_pages_by_offset_until_a_short_page(self):
         ts = [thought(ago(30 - i), "Thabo", f"message {i}", author_id=THABO) for i in range(7)]
-        net = FakeNet(thoughts=ts, model='{"existing": [], "new": []}')
+        net = FakeNet(thoughts=ts, model=EMPTY_ANSWER)
         with mock.patch.object(ol, "PAGE", 3):
             code, _, err = self.run_main(net)
         self.assertEqual(code, 0, err)
-        offsets = [dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(c["url"]).query)).get("offset")
-                   for c in net.calls if "/browse/api/thoughts" in c["url"]]
-        self.assertEqual(offsets, ["0", "3", "6"])
-        user = net.model_requests[0]["messages"][0]["content"]
-        self.assertIn("[m7]", user)
-        self.assertIn("message 6", user)
-        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(net.calls[0]["url"]).query)) if "/thoughts" in net.calls[0]["url"] else \
-            dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(next(c["url"] for c in net.calls if "/thoughts" in c["url"])).query))
-        self.assertEqual((q["source_prefix"], q["order"]), ("discord:", "oldest"))
-        self.assertEqual(when(q["since"]), NOW - timedelta(days=7))
+        queries = [dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(c["url"]).query)) for c in net.calls if "/browse/api/thoughts" in c["url"]]
+        self.assertEqual([q["offset"] for q in queries], ["0", "3", "6"])
+        self.assertEqual((queries[0]["source_prefix"], queries[0]["order"]), ("discord:", "oldest"))
+        self.assertEqual(when(queries[0]["since"]), NOW - timedelta(days=7))
+        self.assertIn("[m7]", net.user_message())
 
-    def test_window_at_the_cap_fails_loudly(self):
+    def test_the_window_cap_is_the_window_total_and_fails_loudly(self):
         ts = [thought(ago(30 - i), "Thabo", f"message {i}", author_id=THABO) for i in range(7)]
-        net = FakeNet(thoughts=ts, model='{"existing": [], "new": []}')
+        net = FakeNet(thoughts=ts, model=EMPTY_ANSWER)
         with mock.patch.object(ol, "PAGE", 3), mock.patch.object(ol, "WINDOW_CAP", 6):
             code, _, err = self.run_main(net)
         self.assertEqual(code, 1)
         self.assertIn("6", err)
+        self.assertIn("total", err)
         self.assertEqual(net.model_requests, [])
 
-    def test_a_server_that_ignores_offset_fails_instead_of_looping(self):
+    def test_row27_a_repeated_page_restarts_the_read_once(self):
         ts = [thought(ago(30 - i), "Thabo", f"message {i}", author_id=THABO) for i in range(7)]
-        net = FakeNet(thoughts=ts, model='{"existing": [], "new": []}')
+        net = FakeNet(thoughts=ts, model=EMPTY_ANSWER)
+        net.repeat_once = True  # a backfill shifted the offsets once
+        with mock.patch.object(ol, "PAGE", 3):
+            code, out, err = self.run_main(net)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("message 6", net.user_message())
+        self.assertEqual(net.user_message().count("message 0"), 1, "nothing is read twice")
+
+    def test_a_server_that_always_ignores_offset_fails_after_one_restart(self):
+        ts = [thought(ago(30 - i), "Thabo", f"message {i}", author_id=THABO) for i in range(7)]
+        net = FakeNet(thoughts=ts, model=EMPTY_ANSWER)
         net.ignore_offset = True
         with mock.patch.object(ol, "PAGE", 3):
             code, _, _ = self.run_main(net)
         self.assertEqual(code, 1)
-        self.assertLessEqual(len([c for c in net.calls if "/thoughts" in c["url"]]), 2)
+        self.assertLessEqual(len([c for c in net.calls if "/thoughts" in c["url"]]), 4)
 
-    def test_a_truncated_loops_list_fails_loudly(self):
-        net = fixture_net()
-        net.loops["total"] = 9
-        code, _, err = self.run_main(net)
+    def test_row13_loops_are_paged_by_offset_not_refused(self):
+        lps = [loop_rec(snow(ago(200 + i)), opened=ago(200 + i), title=f"Loop number {i:02d}") for i in range(5)]
+        net = FakeNet(loops=loops_reply(*lps), model=EMPTY_ANSWER)
+        with mock.patch.object(ol, "LOOPS_PAGE", 2):
+            code, _, err = self.run_main(net)
+        self.assertEqual(code, 0, err)
+        offsets = [dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(c["url"]).query)).get("offset") for c in net.calls if "/browse/api/loops" in c["url"]]
+        self.assertEqual(offsets, ["0", "2", "4"])
+        for lp in lps:
+            self.assertIn(f"key {lp['key']}", net.user_message())
+
+    def test_a_loops_route_that_ignores_offset_fails_instead_of_duplicating(self):
+        lps = [loop_rec(snow(ago(200 + i)), opened=ago(200 + i)) for i in range(5)]
+        net = FakeNet(loops=loops_reply(*lps), model=EMPTY_ANSWER)
+        net.ignore_loops_offset = True
+        with mock.patch.object(ol, "LOOPS_PAGE", 2):
+            code, _, err = self.run_main(net)
         self.assertEqual(code, 1)
         self.assertIn("loops", err.lower())
+        self.assertEqual(net.model_requests, [])
 
     def test_more_than_sixty_open_loops_are_capped_and_said(self):
         lps = [loop_rec(snow(ago(200 + i)), opened=ago(200 + i), title=f"Loop number {i}") for i in range(62)]
-        net = FakeNet(loops=loops_reply(*lps), model='{"existing": [], "new": []}')
+        net = FakeNet(loops=loops_reply(*lps), model=EMPTY_ANSWER)
         code, _, err = self.run_main(net, "--post")
         self.assertEqual(code, 0, err)
-        user = net.model_requests[0]["messages"][0]["content"]
+        user = net.user_message()
         self.assertEqual(sum(1 for lp in lps if f"key {lp['key']}" in user), 60)
         self.assertIn(f"key {lps[0]['key']}", user, "the newest loops are offered")
         self.assertNotIn(f"key {lps[61]['key']}", user)
         self.assertIn("2 loops not evaluated", self.posted(net))
 
+    # --- the post
+
     def test_post_caps_at_fifteen_and_counts_the_rest(self):
         lps = [loop_rec(snow(ago(200 + i)), opened=ago(200 + i), title=f"Loop number {i:02d}") for i in range(18)]
-        net = FakeNet(loops=loops_reply(*lps), model='{"existing": [], "new": []}')
+        net = FakeNet(loops=loops_reply(*lps), model=EMPTY_ANSWER)
         code, _, _ = self.run_main(net, "--post")
         text = self.posted(net)
         self.assertEqual(code, 0)
@@ -1042,19 +1483,48 @@ class Run(JobCase):
         lp = loop_rec(msg_id(opener), opened=ago(40), title="Password reset for Thabo", summary="Long summary that should not repeat.")
         pulse = {"looseEnds": [{"source": opener["metadata"]["source"], "channel": "servest"}],
                  "mapping": [{"channel": "servest", "client": "client:servest", "how": "auto", "messages": 1}]}
-        net = FakeNet(thoughts=[opener], pulse=pulse, loops=loops_reply(lp), model='{"existing": [], "new": []}')
+        net = FakeNet(thoughts=[opener], pulse=pulse, loops=loops_reply(lp), model=EMPTY_ANSWER)
         self.run_main(net, "--post")
         text = self.posted(net)
         self.assertIn("Password reset for Thabo", text)
         self.assertIn("portal", text.split("Password reset for Thabo")[1].splitlines()[0])
         self.assertNotIn("Long summary that should not repeat.", text)
 
+    def test_row25_model_text_is_escaped_in_the_post(self):
+        lp = loop_rec(snow(ago(40)), opened=ago(40), title="**Urgent** ~~old~~ <@123> @everyone `x` [y](z)",
+                      summary="Ping <@&456> and #general > quote _it_", owner="Kelli_* @here")
+        net = FakeNet(loops=loops_reply(lp), model=EMPTY_ANSWER)
+        self.run_main(net, "--post")
+        text = self.posted(net)
+        for raw in ("**Urgent**", "~~old~~", "<@123>", "<@&456>", "`x`", "[y](z)", "_it_", "Kelli_*"):
+            self.assertNotIn(raw, text)
+        self.assertIn(r"\*\*Urgent\*\*", text)
+        self.assertIn(r"\<\@123\>", text)
+
+    def test_row24_a_rate_limited_webhook_is_retried_after_retry_after(self):
+        net = fixture_net()
+        net.webhook_429 = 1
+        code, out, err = self.run_main(net, "--post")
+        self.assertEqual(code, 0, out + err)
+        self.assertGreaterEqual(len(net.posts), 1)
+        self.assertIn(0.25, self.sleeps)
+        self.assertNotIn("Open loops job failed", self.posted(net))
+
+    def test_a_webhook_that_keeps_rate_limiting_fails_loudly(self):
+        net = fixture_net()
+        net.webhook_429 = 50
+        code, _, err = self.run_main(net, "--post")
+        self.assertEqual(code, 1)
+        self.assertIn("429", err)
+
     def test_unreadable_lines_are_said_not_dropped(self):
         net = fixture_net()
-        net.loops["unreadable"] = [{"subject": "loop:42", "lineId": "fact_bad"}]
+        net.unreadable = [{"subject": "loop:42", "lineId": "fact_bad"}]
         code, _, _ = self.run_main(net, "--post")
         self.assertEqual(code, 0)
         self.assertIn("1 loop lines unreadable", self.posted(net))
+
+    # --- settings
 
     def test_missing_settings_fail_in_one_line_before_any_read(self):
         self.env_path.write_text(ENV_TEXT.replace(f"XACTCO_MEMBERS={MEMBERS_RAW}\n", ""), encoding="utf-8")
@@ -1064,7 +1534,6 @@ class Run(JobCase):
         self.assertEqual(net.calls, [])
         self.assertIn("XACTCO_MEMBERS", err)
         self.assertEqual(len([ln for ln in err.splitlines() if ln.strip()]), 1)
-        # With --post the channel is told too, and nothing else is called.
         net = fixture_net()
         code, _, _ = self.run_main(net, "--post")
         self.assertNotEqual(code, 0)
@@ -1094,7 +1563,7 @@ class Unpark(JobCase):
                       f"summary=The quarterly review pack was asked for. | evidence={key}")
         parked = loop_rec(key, opened=opened, state="parked", title=self.TITLE, summary="(as the view shows it)", line="fact_parked")
         parked.update({"until": until, "byUser": KELLI, "byName": "kelli", "note": "after the QBR"})
-        net = FakeNet(thoughts=thoughts, loops=loops_reply(parked), model='{"existing": [], "new": []}')
+        net = FakeNet(thoughts=thoughts, loops=loops_reply(parked), model=EMPTY_ANSWER)
         history = [{"id": "fact_parked", "subject": f"loop:{key}", "proof": proof, "supersedes": "fact_open" if with_open_line else None,
                     "claim": f"PARKED/1 | key={key} | by_user={KELLI} | by_name=kelli | until={until} | note=after the QBR"}]
         if with_open_line:
@@ -1115,18 +1584,28 @@ class Unpark(JobCase):
                 self.assertEqual(fields, parse_line(open_claim)[1], "every OPEN field comes from the OPEN line before it")
                 self.assertNotIn("note=", w["content"])
                 self.assertEqual(w["source"], f"discord:{GUILD}/{SERVEST}/{key}")
-                self.assertIn(f"key {key}", net.model_requests[0]["messages"][0]["content"], "it is offered to the model")
+                self.assertIn(f"key {key}", net.user_message(), "it is offered to the model")
                 self.assertIn(self.TITLE, self.posted(net))
 
     def test_a_parked_loop_not_yet_due_is_left_alone(self):
-        for until in ("2026-10-28", "2026-10-27T06:00:00Z", "not a date", ""):  # tomorrow, 08:00 SAST today, unreadable
+        for until in ("2026-10-28", "2026-10-27T06:00:00Z"):  # tomorrow, 08:00 SAST today
             with self.subTest(until=until):
                 net, key, _ = self.parked_net(until)
                 code, _, _ = self.run_main(net, "--post")
                 self.assertEqual(code, 0)
                 self.assertEqual(net.captures, [])
-                self.assertNotIn(key, net.model_requests[0]["messages"][0]["content"])
+                self.assertNotIn(key, net.user_message())
                 self.assertNotIn(self.TITLE, self.posted(net))
+
+    def test_row15_an_until_nobody_can_read_is_logged_not_silently_kept(self):
+        for until in ("2026-02-30", "not a date", ""):
+            with self.subTest(until=until):
+                net, key, _ = self.parked_net(until)
+                code, out, err = self.run_main(net, "--post")
+                self.assertEqual(code, 0)
+                self.assertEqual(net.captures, [])
+                self.assertIn("unpark.bad_until", out + err)
+                self.assertIn(key, out + err)
 
     def test_dry_run_says_it_would_unpark_and_writes_nothing(self):
         net, key, _ = self.parked_net("2026-10-26")
@@ -1134,7 +1613,7 @@ class Unpark(JobCase):
         self.assertEqual(code, 0)
         self.assertEqual((net.captures, net.posts), ([], []))
         self.assertIn("would unpark 1", out)
-        self.assertIn(f"key {key}", net.model_requests[0]["messages"][0]["content"])
+        self.assertIn(f"key {key}", net.user_message())
 
     def test_a_close_later_in_the_run_supersedes_the_unpark_line_not_the_parked_one(self):
         reply = thought(ago(10), "Kelli", "The pack is on the portal.", author_id=KELLI)
@@ -1154,8 +1633,17 @@ class Unpark(JobCase):
         self.assertNotEqual(code, 0)
         self.assertEqual(net.captures, [])
         self.assertIn("unpark.failed", err)
-        self.assertNotIn(key, net.model_requests[0]["messages"][0]["content"])
+        self.assertNotIn(key, net.user_message())
         self.assertIn("1 ledger write failed", self.posted(net))
+
+    def test_unparked_by_a_person_during_the_run_is_a_conflict_not_a_failure(self):
+        net, key, _ = self.parked_net("2026-10-26")
+        net.ledger[f"loop:{key}"][0]["supersededBy"] = "fact_kelli_unpark"
+        net.ledger[f"loop:{key}"].insert(0, {"id": "fact_kelli_unpark", "subject": f"loop:{key}", "claim": "OPEN/1 | key=" + key, "supersedes": "fact_parked"})
+        code, out, err = self.run_main(net, "--post")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len(net.captures_for(key)), 1)
+        self.assertIn("1 loop changed by someone else during the run", self.posted(net))
 
 
 class Check(JobCase):
