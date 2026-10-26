@@ -6,7 +6,7 @@
  * confirmation, and find's newest-wins default.
  */
 import { assert, assertEquals, assertNotEquals, assertRejects, assertStrictEquals } from "@std/assert";
-import type { Ledger } from "../core/ports/mod.ts";
+import type { Fact, Ledger } from "../core/ports/mod.ts";
 
 export type LedgerFactory = () => Promise<{ ledger: Ledger; close?: () => Promise<void> }>;
 
@@ -184,6 +184,34 @@ export function runLedgerContract(name: string, make: LedgerFactory) {
     await assertRejects(() => l.assert(A, { subject: "other", claim: "v3", source: "s", supersedes: v2.id }), Error, "same subject");
     await assertRejects(() => l.assert(A, { subject: "s", claim: "v3", source: "s", supersedes: "00000000-0000-0000-0000-000000000000" }), Error, "No fact");
     assertEquals((await l.history(A, "s")).length, 2, "a refused assert stores nothing");
+  });
+
+  t("supersedes under concurrency: two writers racing to replace one line, exactly one wins, the loser is refused and stores nothing, one head remains", async (l) => {
+    const old = await l.assert(A, { subject: "loop:1", claim: "OPEN", source: "s" });
+    await tick();
+    const raced = await Promise.allSettled([
+      l.assert(A, { subject: "loop:1", claim: "RESOLVED", source: "press:1", supersedes: old.id }),
+      l.assert(A, { subject: "loop:1", claim: "PARKED", source: "press:2", supersedes: old.id }),
+    ]);
+    assertEquals(raced.filter((r) => r.status === "fulfilled").length, 1, `exactly one write may win: ${JSON.stringify(raced.map((r) => r.status))}`);
+    const lost = raced.find((r): r is PromiseRejectedResult => r.status === "rejected")!;
+    assert(String((lost.reason as Error)?.message).includes("already superseded"), String(lost.reason));
+    const won = raced.find((r): r is PromiseFulfilledResult<Fact> => r.status === "fulfilled")!.value;
+    const h = await l.history(A, "loop:1");
+    assertEquals(h.length, 2, "the losing write stores nothing");
+    assertEquals(h.find((f) => f.id === old.id)?.supersededBy, won.id);
+    assertEquals(h.filter((f) => !f.supersededBy).map((f) => f.id), [won.id], "one live head, never a fork");
+
+    const base = await l.assert(A, { subject: "loop:2", claim: "OPEN", source: "s" });
+    await tick();
+    const x = await l.assert(A, { subject: "loop:2", claim: "X", source: "s" });
+    const y = await l.assert(A, { subject: "loop:2", claim: "Y", source: "s" });
+    const linked = await Promise.allSettled([l.supersede(A, x.id, base.id), l.supersede(A, y.id, base.id)]);
+    assertEquals(linked.filter((r) => r.status === "fulfilled").length, 1, "supersede() races the same way");
+    const h2 = await l.history(A, "loop:2");
+    const winner = h2.find((f) => f.id === base.id)!.supersededBy;
+    assert(winner === x.id || winner === y.id, String(winner));
+    assertEquals(h2.filter((f) => f.supersedes === base.id).map((f) => f.id), [winner], "only the winner says it supersedes the base");
   });
 
   t("all lines superseded: latest is null while history still shows every line", async (l) => {
