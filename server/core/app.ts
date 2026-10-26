@@ -306,20 +306,30 @@ export function buildServer(ports: Ports, options: CoreOptions, scope: Scope): M
         in_reply_to: z.string().max(300).optional().describe(
           "The source of the message this one replies to (e.g. \"discord:<guild>/<channel>/<message>\"), linking an answer to its question.",
         ),
+        supersedes: z.string().max(100).optional().describe(
+          "The id of the older fact this one replaces, about the same subject; needs subject. Refused when that fact is already replaced, is about another subject, or does not exist, so a stale id never forks the history.",
+        ),
+        author_id: z.string().max(100).optional().describe("The id of who said it (a Discord user id), so readers can tell people apart by id, not by display name."),
+        channel_id: z.string().max(100).optional().describe("The id of the channel or thread it was said in."),
+        parent_id: z.string().max(100).optional().describe("For a message in a thread: the id of the channel the thread belongs to."),
       },
     },
-    async ({ content, source, subject, proof, occurred_at, channel, thread, in_reply_to }) => {
+    async ({ content, source, subject, proof, occurred_at, channel, thread, in_reply_to, supersedes, author_id, channel_id, parent_id }) => {
       try {
         called("capture_thought");
         const where: Record<string, string> = {};
         if (channel?.trim()) where.channel = channel.trim().replace(/^#/, "").trim();
         if (thread?.trim()) where.thread = thread.trim();
         if (in_reply_to?.trim()) where.in_reply_to = in_reply_to.trim();
-        const done = await capture(ports, scope, { content, source, subject, proof, occurredAt: occurred_at, metadata: where });
+        if (author_id?.trim()) where.author_id = author_id.trim();
+        if (channel_id?.trim()) where.channel_id = channel_id.trim();
+        if (parent_id?.trim()) where.parent_id = parent_id.trim();
+        const done = await capture(ports, scope, { content, source, subject, proof, occurredAt: occurred_at, metadata: where, supersedes });
         const { understood } = done;
         let confirmation = done.kind === "fact"
           ? `Recorded fact ${done.id} about ${done.fact.subject} (from ${done.fact.source}, by ${done.fact.learnedBy}, unconfirmed)`
           : `Captured as ${understood.type || "thought"}`;
+        if (done.kind === "fact" && done.understandFailed) confirmation += " | understanding unavailable: recorded without tags";
         if (done.kind === "thought" && understood.topics.length) confirmation += ` — ${understood.topics.join(", ")}`;
         if (understood.people.length) confirmation += ` | People: ${understood.people.join(", ")}`;
         if (understood.action_items.length) confirmation += ` | Actions: ${understood.action_items.join("; ")}`;

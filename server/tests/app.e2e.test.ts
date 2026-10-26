@@ -47,7 +47,7 @@ Deno.test("initialize and tools/list expose the six upstream tools plus the ledg
   const list = await rpc(app, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
   assertEquals(list.body.result.tools.map((t: { name: string }) => t.name).sort(), [...UPSTREAM_TOOLS, ...LEDGER_TOOLS, ...WRITER_TOOLS].sort());
   const capture = list.body.result.tools.find((t: { name: string }) => t.name === "capture_thought");
-  assertEquals(Object.keys(capture.inputSchema.properties).sort(), ["channel", "content", "in_reply_to", "occurred_at", "proof", "source", "subject", "thread"]);
+  assertEquals(Object.keys(capture.inputSchema.properties).sort(), ["author_id", "channel", "channel_id", "content", "in_reply_to", "occurred_at", "parent_id", "proof", "source", "subject", "supersedes", "thread"]);
   assertEquals(capture.inputSchema.required, ["content"]);
 });
 
@@ -625,4 +625,115 @@ Deno.test("swap the memory: keyword vs vector, identical tool output", async () 
   assertEquals(b, a);
   assertStringIncludes(a[3], "100.0% match");
   assertStringIncludes(a[6], "Total thoughts: 2");
+});
+
+// --- Plan 5, C4: capture_thought's supersedes, author_id, channel_id, parent_id, and facts that outlive an Understanding outage ---
+
+const ALICE = { tenant: "alice", actor: "alice" };
+const factIdOf = (r: { result: { content: { text: string }[] } }) => /Recorded fact (\S+) about/.exec(r.result.content[0].text)?.[1] ?? "";
+
+Deno.test("capture_thought stores author_id, channel_id and parent_id trimmed on the thought; blank ones are not stored", async () => {
+  const memory = new KeywordMemory();
+  const app = buildApp(ports(memory), OPTIONS);
+  await call(app, 1, "capture_thought", { content: "a thread reply", author_id: " 4242 ", channel_id: " 777 ", parent_id: " 900 ", in_reply_to: "discord:g/900/1" });
+  await call(app, 2, "capture_thought", { content: "no ids at all", author_id: "  ", channel_id: "", parent_id: " " });
+  const all = await memory.recent(ALICE, { limit: 10 });
+  const full = all.find((t) => t.content === "a thread reply")!;
+  const blank = all.find((t) => t.content === "no ids at all")!;
+  assertEquals([full.metadata.author_id, full.metadata.channel_id, full.metadata.parent_id, full.metadata.in_reply_to], ["4242", "777", "900", "discord:g/900/1"]);
+  for (const k of ["author_id", "channel_id", "parent_id"]) assert(!(k in blank.metadata), `${k} stored blank: ${JSON.stringify(blank.metadata)}`);
+});
+
+Deno.test("capture_thought: supersedes without a subject is refused before any model call and stores nothing; a blank supersedes is no supersedes", async () => {
+  let calls = 0;
+  const counting = { understand: () => (calls++, Promise.resolve(understood)) };
+  const memory = new KeywordMemory();
+  const ledger = new InProcessLedger();
+  const app = buildApp(ports(memory, { understander: counting, ledger }), OPTIONS);
+  for (const args of [{ supersedes: "fact_x" }, { supersedes: "fact_x", subject: "   " }]) {
+    const r = await call(app, 1, "capture_thought", { content: "RESOLVED/1 | key=1", ...args });
+    assertEquals(r.result.isError, true, JSON.stringify(args));
+    assertStringIncludes(r.result.content[0].text, "supersedes");
+    assertStringIncludes(r.result.content[0].text, "subject");
+  }
+  assertEquals(calls, 0, "refused before the model is paid for");
+  assertEquals((await memory.summary(ALICE)).count, 0);
+  assertEquals(await ledger.subjects(ALICE), []);
+  const plain = await call(app, 2, "capture_thought", { content: "an ordinary note", supersedes: "   " });
+  assertEquals(plain.result.isError, undefined);
+  assertEquals((await memory.summary(ALICE)).count, 1);
+});
+
+Deno.test("capture_thought supersedes: a valid id links both lines; a stale, other-subject, other-tenant or unknown id is refused and writes nothing", async () => {
+  const ledger = new InProcessLedger();
+  const app = buildApp(ports(new KeywordMemory(), { ledger }), OPTIONS);
+  const bobApp = buildApp(ports(new KeywordMemory(), { ledger, gate: new OpenGate(true, "bob", "bob") }), OPTIONS);
+  const open = factIdOf(await call(app, 1, "capture_thought", { content: "OPEN/1 | key=1", subject: "loop:1", source: "s" }));
+  const resolved = factIdOf(await call(app, 2, "capture_thought", { content: "RESOLVED/1 | key=1", subject: "loop:1", source: "discord:interaction/9", supersedes: ` ${open} ` }));
+  const h = await ledger.history(ALICE, "loop:1");
+  assertEquals(h.find((f) => f.id === open)?.supersededBy, resolved);
+  assertEquals(h.find((f) => f.id === resolved)?.supersedes, open);
+
+  const stale = await call(app, 3, "capture_thought", { content: "PARKED/1 | key=1", subject: "loop:1", source: "s", supersedes: open });
+  assertEquals(stale.result.isError, true);
+  assertStringIncludes(stale.result.content[0].text, "already superseded");
+
+  const other = factIdOf(await call(app, 4, "capture_thought", { content: "OPEN/1 | key=2", subject: "loop:2", source: "s" }));
+  const crossed = await call(app, 5, "capture_thought", { content: "RESOLVED/1 | key=1", subject: "loop:1", source: "s", supersedes: other });
+  assertEquals(crossed.result.isError, true);
+  assertStringIncludes(crossed.result.content[0].text, "same subject");
+
+  const bobs = factIdOf(await call(bobApp, 6, "capture_thought", { content: "OPEN/1 | key=1", subject: "loop:1", source: "s" }));
+  const foreign = await call(app, 7, "capture_thought", { content: "RESOLVED/1 | key=1", subject: "loop:1", source: "s", supersedes: bobs });
+  assertEquals(foreign.result.isError, true);
+  assertStringIncludes(foreign.result.content[0].text, "No fact");
+  assertEquals((await ledger.latest({ tenant: "bob", actor: "bob" }, "loop:1"))?.id, bobs);
+  assertEquals((await ledger.latest({ tenant: "bob", actor: "bob" }, "loop:1"))?.supersededBy, undefined, "bob's line is untouched");
+
+  const unknown = await call(app, 8, "capture_thought", { content: "RESOLVED/1 | key=1", subject: "loop:1", source: "s", supersedes: "fact_nope" });
+  assertEquals(unknown.result.isError, true);
+  assertStringIncludes(unknown.result.content[0].text, "No fact");
+
+  assertEquals((await ledger.history(ALICE, "loop:1")).length, 2, "four refusals, no lines");
+  assertEquals((await ledger.latest(ALICE, "loop:1"))?.id, resolved);
+});
+
+Deno.test("capture_thought supersedes: two presses racing on the same line, exactly one wins and the loop keeps one head", async () => {
+  const ledger = new InProcessLedger();
+  const app = buildApp(ports(new KeywordMemory(), { ledger }), OPTIONS);
+  const open = factIdOf(await call(app, 1, "capture_thought", { content: "OPEN/1 | key=1", subject: "loop:1", source: "s" }));
+  const [a, b] = await Promise.all([
+    call(app, 2, "capture_thought", { content: "RESOLVED/1 | key=1", subject: "loop:1", source: "discord:interaction/1", supersedes: open }),
+    call(app, 3, "capture_thought", { content: "PARKED/1 | key=1", subject: "loop:1", source: "discord:interaction/2", supersedes: open }),
+  ]);
+  assertEquals([a.result.isError, b.result.isError].filter((e) => e === true).length, 1, JSON.stringify([a.result, b.result]));
+  assertEquals((await ledger.history(ALICE, "loop:1")).filter((f) => !f.supersededBy).length, 1);
+});
+
+Deno.test("a fact survives an Understanding outage: written with empty tags, logged as fact.understand_failed; a thought still fails loudly", async () => {
+  const log = new RecordingLog();
+  const ledger = new InProcessLedger();
+  const memory = new KeywordMemory();
+  const dead = { understand: () => Promise.reject(new Error("model 503")) };
+  const app = buildApp(ports(memory, { understander: dead, ledger, log }), OPTIONS);
+  const r = await call(app, 1, "capture_thought", { content: "OPEN/1 | key=1", subject: "loop:1", source: "job:open-loops" });
+  assertEquals(r.result.isError, undefined, JSON.stringify(r.result));
+  assertStringIncludes(r.result.content[0].text, "Recorded fact ");
+  assertStringIncludes(r.result.content[0].text, "without tags");
+  const first = await ledger.latest(ALICE, "loop:1");
+  assertEquals(first?.tags, []);
+  const failed = log.events.filter((e) => e.event === "fact.understand_failed");
+  assertEquals(failed.length, 1);
+  assertEquals([failed[0].level, failed[0].fields?.subject, failed[0].fields?.tenant, failed[0].fields?.actor, failed[0].fields?.source], ["error", "loop:1", "alice", "alice", "job:open-loops"]);
+  assertStringIncludes(String((failed[0].err as Error)?.message), "503");
+  assert(log.events.some((e) => e.event === "fact.asserted" && e.fields?.id === first?.id), "the write itself is still logged");
+
+  const next = await call(app, 2, "capture_thought", { content: "RESOLVED/1 | key=1", subject: "loop:1", source: "s", supersedes: first!.id });
+  assertEquals(next.result.isError, undefined, "a press is never lost to a model outage");
+  assertEquals((await ledger.latest(ALICE, "loop:1"))?.supersedes, first!.id);
+
+  const thought = await call(app, 3, "capture_thought", { content: "a plain note" });
+  assertEquals(thought.result.isError, true);
+  assertStringIncludes(thought.result.content[0].text, "Failed to capture: model 503");
+  assertEquals((await memory.summary(ALICE)).count, 0);
 });
