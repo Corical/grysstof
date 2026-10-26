@@ -11,6 +11,11 @@
  * (an ISO date; every readable text channel with no watermark yet is seeded to it,
  * so the next start imports history from that date; remove it once done).
  *
+ * The loops assistant (writer/discord-pa.ts): PA_ENABLED (unset means off), PA_USERS
+ * (comma-separated Discord user ids allowed to use /loops). When on, /loops and /loops-help are
+ * registered in each allowed guild at READY; interactions are handled beside the capture queue,
+ * never in it, and can never end the process.
+ *
  * Idempotent across restarts: the last captured message id per channel is
  * written after every successful post; on start, every known channel is
  * backfilled from its watermark, so downtime loses nothing and nothing is
@@ -18,6 +23,8 @@
  */
 import { advance, type Capture, type DiscordMessage, distil, type Names, type Reaction, type Watermarks } from "../writer/discord.ts";
 import { type ReactionIo, syncChannelReactions, syncMessageReactions } from "../writer/discord-reactions.ts";
+import { type Interaction, onInteraction, type PaIo, paConfig, registerCommands } from "../writer/discord-pa.ts";
+import { browseLoops, discordClient, type HttpDeps, mcpCapture } from "../writer/discord-rest.ts";
 
 const API = "https://discord.com/api/v10";
 const INTENTS = (1 << 0) | (1 << 9) | (1 << 10) | (1 << 15); // GUILDS, GUILD_MESSAGES, GUILD_MESSAGE_REACTIONS, MESSAGE_CONTENT
@@ -46,6 +53,18 @@ async function log(fields: Record<string, unknown>) {
     await Deno.writeTextFile(`${logDir}/discord.log`, line + "\n", { append: true });
   } catch { /* the log is a courtesy */ }
 }
+
+// --- the loops assistant ---
+const pa = paConfig(Deno.env.get("PA_ENABLED"), Deno.env.get("PA_USERS"));
+const paRest: HttpDeps = { onRateLimit: (f) => void log({ event: "discord.rate_limited", ...f }) };
+const paIo: PaIo = {
+  discord: discordClient(token!, paRest),
+  loops: browseLoops(brainUrl, key!, paRest),
+  capture: mcpCapture(brainUrl, key!, paRest),
+  log,
+  now: () => new Date(),
+};
+let commandsRegistered = false;
 
 // --- names: guild and channel ids to what a person calls them ---
 const guilds = new Map<string, string>();
@@ -322,11 +341,25 @@ function connect(url: string, resume: boolean) {
 async function dispatch(t: string, d: unknown) {
   switch (t) {
     case "READY": {
-      const r = d as { session_id: string; resume_gateway_url: string; user: { username: string } };
+      const r = d as { session_id: string; resume_gateway_url: string; user: { username: string }; application?: { id?: string }; guilds?: { id: string }[] };
       sessionId = r.session_id;
       resumeUrl = r.resume_gateway_url;
-      await log({ event: "gateway.ready", bot: r.user.username, brain: brainUrl, watermarks: Object.keys(marks).length });
+      await log({
+        event: "gateway.ready",
+        bot: r.user.username,
+        brain: brainUrl,
+        watermarks: Object.keys(marks).length,
+        pa: pa.enabled ? `on, ${pa.users.size} user(s)` : "off",
+      });
       backfill().then(reactionCatchUp);
+      if (pa.enabled && !commandsRegistered) {
+        // Beside the backfill, never awaited, never rejecting; a failure is retried at the next READY.
+        commandsRegistered = true;
+        const ids = (r.guilds ?? []).map((g) => g.id);
+        registerCommands(paIo, r.application?.id ?? "", ids).then((ok) => {
+          if (!ok) commandsRegistered = false;
+        });
+      }
       break;
     }
     case "RESUMED":
@@ -353,6 +386,11 @@ async function dispatch(t: string, d: unknown) {
     case "MESSAGE_REACTION_REMOVE_ALL":
     case "MESSAGE_REACTION_REMOVE_EMOJI":
       reactionChanged(d as { guild_id?: string; channel_id: string; message_id: string });
+      break;
+    case "INTERACTION_CREATE":
+      // Not awaited and never rejecting: a command must not wait behind a capture, and nothing the
+      // PA does can throw out of this handler and end the process.
+      onInteraction(pa, paIo, d as Interaction).catch(() => {});
       break;
   }
 }
