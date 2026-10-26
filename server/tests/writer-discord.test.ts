@@ -67,6 +67,34 @@ Deno.test("distil: carries the channel by name, the thread when in one, and what
   assertEquals(dm.inReplyTo, "discord:@me/1418000000000000001/9");
 });
 
+Deno.test("distil: carries the author's id, the channel's id and, in a thread, the parent channel's id, so a closing reply can be matched by id rather than by name", () => {
+  const plain = distil(base, names);
+  assert(!("skip" in plain));
+  assertEquals([plain.authorId, plain.channelId, plain.parentId], ["7", "1418000000000000001", undefined]);
+  assertEquals("parentId" in plain, false, "a channel that is not a thread sends no parent at all, not an empty one");
+
+  const threadMsg = { ...base, channel_id: "1420000000000000009" };
+  const inThread = distil(threadMsg, { guild: "Xactco", channel: "hold decision", parent: "reporting", parentId: "1418000000000000001" });
+  assert(!("skip" in inThread));
+  assertEquals([inThread.channelId, inThread.parentId, inThread.channel, inThread.thread], ["1420000000000000009", "1418000000000000001", "reporting", "hold decision"]);
+
+  const nameless = distil(threadMsg, { channel: "hold decision", parentId: "1418000000000000001" });
+  assert(!("skip" in nameless));
+  assertEquals(nameless.parentId, "1418000000000000001", "the parent's name may be unknown; its id still travels");
+
+  const renamed = distil({ ...base, author: { ...base.author, global_name: "Someone Else", username: "corne_new" } }, names);
+  assert(!("skip" in renamed));
+  assertEquals(renamed.authorId, "7", "a changed display name or username never changes who said it");
+
+  const reply = distil({ ...base, type: 19, author: { id: "8", username: "luke" }, referenced_message: { author: { id: "7", username: "corne" }, content: "can we close this?" } }, names);
+  assert(!("skip" in reply));
+  assertEquals(reply.authorId, "8", "the replier, never the person replied to");
+
+  const dm = distil({ ...base, guild_id: undefined }, { channel: "dm" });
+  assert(!("skip" in dm));
+  assertEquals([dm.authorId, dm.channelId], ["7", "1418000000000000001"]);
+});
+
 Deno.test("reactionsOf: who reacted with what, by display name; custom emoji readable; bots never count as people; none is empty", () => {
   const kelli = { id: "1", username: "kellireynolds", global_name: "Kelli" };
   const devon = { id: "2", username: "dman_devon", global_name: "Devon" };

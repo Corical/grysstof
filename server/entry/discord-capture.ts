@@ -92,7 +92,8 @@ async function namesFor(m: DiscordMessage): Promise<Names> {
     c = channels.get(m.channel_id) ?? { name: m.channel_id, type: 0 };
   }
   const parent = THREAD_TYPES.has(c.type) && c.parent ? channels.get(c.parent)?.name : undefined;
-  return { guild: m.guild_id ? guilds.get(m.guild_id) : undefined, channel: c.name, parent, channelNames: (id) => channels.get(id)?.name };
+  const parentId = THREAD_TYPES.has(c.type) ? c.parent : undefined; // a plain channel's parent is its category, not a conversation
+  return { guild: m.guild_id ? guilds.get(m.guild_id) : undefined, channel: c.name, parent, parentId, channelNames: (id) => channels.get(id)?.name };
 }
 
 // --- watermarks ---
@@ -133,6 +134,9 @@ async function post(c: Capture): Promise<string> {
           channel: c.channel,
           ...(c.thread ? { thread: c.thread } : {}),
           ...(c.inReplyTo ? { in_reply_to: c.inReplyTo } : {}),
+          author_id: c.authorId,
+          channel_id: c.channelId,
+          ...(c.parentId ? { parent_id: c.parentId } : {}),
         },
       },
     }),
