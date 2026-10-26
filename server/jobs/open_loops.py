@@ -3,33 +3,36 @@
 
 Reads the last 7 days of Discord messages and every recorded loop through Grysstof's read API, asks the
 model which recorded loops closed or moved and which new ones exist (contract C5 of plan 5), checks every
-claim in code, writes one ledger line per change through /mcp (C1, C2), and posts the list.
+claim in code, writes one ledger line per change through /mcp (C1, C2), reads /loops again, and posts it.
+The job owns the C2 and C5 rules (plan v3.1); C1 lines are sanitised exactly as core/loops.ts does.
 
 Usage:
   open_loops.py --env FILE --check     reads, settings present, Pi clock vs Discord; no model, no writes, no post
   open_loops.py --env FILE             dry run: model pass, prints "would unpark N", "would open N, close M,
                                        update K" and the post; writes nothing
   open_loops.py --env FILE --post      writes the ledger lines, then posts to the webhook
-
-A parked loop whose `until` has passed is put back to OPEN at the start of the run (one OPEN line superseding
-the PARKED line, every field carried from the OPEN line before it) and then takes part like any open loop.
   --lock FILE                          take this lock for the run; if another run holds it, exit at once
                                        (and, with --post, say so in the channel when it is over an hour old)
 
-Env file (KEY=value lines): ANTHROPIC_API_KEY, OPEN_LOOPS_WEBHOOK, GRYSSTOF_URL (the server's /mcp URL),
-MCP_ACCESS_KEY, XACTCO_MEMBERS (comma-separated Discord user ids, each optionally "id:Name").
+A parked loop whose `until` has passed is put back to OPEN at the start of the run (one OPEN line superseding
+the PARKED line, every field carried from the OPEN line before it) and then takes part like any open loop.
+
+Env file (KEY=value lines): OPEN_LOOPS_WEBHOOK, GRYSSTOF_URL (the server's /mcp URL), MCP_ACCESS_KEY,
+XACTCO_MEMBERS (comma-separated Discord user ids, each optionally "id:Name"), OPEN_LOOPS_MODEL_PROVIDER
+(default anthropic), OPEN_LOOPS_MODEL (default claude-sonnet-5-5), and the provider's key (ANTHROPIC_API_KEY).
 
 Standard library only. Every Grysstof, Discord and webhook call has a 30-second timeout; the streamed model call
-allows 120 seconds of silence. Every failure prints one line and exits non-zero.
+allows 120 seconds of silence; the reads, the model call and the writes share a 780-second deadline (cron kills
+at 900). SIGTERM runs the failure path. Every failure prints one line and exits non-zero.
 """
 import argparse
 import email.utils
 import json
 import os
 import re
+import signal
 import sys
 import time
-import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,7 +50,8 @@ except ImportError:  # Windows, where the tests run
 SAST = timezone(timedelta(hours=2))
 UTC = timezone.utc
 DEFAULT_ENV = Path("/home/corical/open-loops/.env")
-MODEL = "claude-sonnet-5-5"
+DEFAULT_PROVIDER = "anthropic"
+DEFAULT_MODEL = "claude-sonnet-5-5"
 MAX_TOKENS = 16000
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 DISCORD_CLOCK_URL = "https://discord.com/api/v10/gateway"
@@ -56,26 +60,34 @@ DAYS = 7
 HTTP_TIMEOUT = 30          # seconds, every Grysstof, Discord and webhook call
 MODEL_IDLE_TIMEOUT = 120   # the model call streams; this is the longest silence allowed while it thinks with its
                            # thinking hidden (the default), which can be a long pause before the first text
-                           # (the whole run is bounded by `timeout 900` in cron)
+DEADLINE_SECONDS = 780     # reads, model call and writes together; the cron line kills at 900, leaving time to post
+REREAD_PAUSE = 10          # after a write times out, wait this long before the one re-read
 PAGE = 500                 # /thoughts page size
-WINDOW_CAP = 2000          # a window this big is a flood or a backfill: fail rather than cut it
-LOOPS_LIMIT = 2000
+WINDOW_CAP = 2000          # the whole 7-day window, every page together: more is a flood or a backfill
+LOOPS_PAGE = 2000          # /loops page size (the route's maximum)
 MAX_OFFERED = 60           # open loops handed to the model, newest first
 POST_CAP = 15
 MAX_SKEW_SECONDS = 60
 LOCK_STALE_SECONDS = 3600
 DISCORD_LIMIT = 1900
+WEBHOOK_TRIES = 4
+MAX_RETRY_AFTER = 30.0
 MAX_EVIDENCE = 8
+NAME_CAP = 100             # C1 (core/loops.ts LIMITS.name): owner, channel, by_name
+ID_CAP = 100               # C1 (LIMITS.id): keys, codes, ids and times
 SKIP_CHANNELS = {"standup", "general_announcements", "general"}
 TYPES = ("unanswered_question", "unkept_promise", "stale_followup", "unticketed_ask")
 MIN_AGE_HOURS = {"unanswered_question": 4, "unticketed_ask": 4, "unkept_promise": 24, "stale_followup": 48}
-REQUIRED = ("GRYSSTOF_URL", "MCP_ACCESS_KEY", "XACTCO_MEMBERS", "ANTHROPIC_API_KEY")
-CHECKED = ("ANTHROPIC_API_KEY", "OPEN_LOOPS_WEBHOOK", "GRYSSTOF_URL", "MCP_ACCESS_KEY", "XACTCO_MEMBERS")
+BASE_SETTINGS = ("GRYSSTOF_URL", "MCP_ACCESS_KEY", "XACTCO_MEMBERS")
 SOURCE_RE = re.compile(r"^discord:([^/]+)/(\d+)/(\d+)$")
 PROOF_RE = re.compile(r"^https://discord\.com/channels/([^/]+)/(\d+)/(\d+)$")
 AUTHOR_RE = re.compile(r", \d{4}-\d{2}-\d{2}, ([^:\n]+?): ")
-KEY_RE = re.compile(r"^(\d+)(?::([a-z]))?(?::(\d+))?$")
+KEY_RE = re.compile(r"^(\d{17,20})(?::([a-z]))?(?::(\d{1,3}))?$")  # the key grammar of plan v3.1 (core/loops.ts KEY_RE)
+LETTERS = [""] + [chr(c) for c in range(ord("b"), ord("z") + 1)]
 DISCORD_EPOCH_MS = 1420070400000
+
+monotonic = time.monotonic  # module names, so the tests can drive the clock and skip the waits
+sleep = time.sleep
 
 
 class JobError(Exception):
@@ -87,6 +99,24 @@ class ConfigError(JobError):
 
 
 class ModelError(JobError):
+    pass
+
+
+class RequestTimeout(JobError):
+    """The request may still be running on the server: never assume it did not land."""
+
+
+class HttpFailure(JobError):
+    def __init__(self, message, code, body, headers):
+        super().__init__(message)
+        self.code, self.body, self.headers = code, body, headers
+
+
+class Terminated(JobError):
+    """SIGTERM (the cron timeout). Raised from the signal handler so the failure path runs."""
+
+
+class DeadlineExceeded(JobError):
     pass
 
 
@@ -141,23 +171,84 @@ def read_env(path) -> dict:
     return out
 
 
-# --- C1: the line ---------------------------------------------------------------------------------------------
+# --- the deadline -------------------------------------------------------------------------------------------
+
+_deadline = None
+
+
+def set_deadline(seconds) -> None:
+    global _deadline
+    _deadline = None if seconds is None else monotonic() + seconds
+
+
+def remaining():
+    return None if _deadline is None else _deadline - monotonic()
+
+
+def budget(cap: float) -> float:
+    """A call's timeout: its own cap, never past the run's deadline."""
+    r = remaining()
+    if r is None:
+        return cap
+    if r <= 0:
+        raise DeadlineExceeded(f"the run passed its {DEADLINE_SECONDS} s deadline")
+    return min(cap, r)
+
+
+# --- C1: the line, as core/loops.ts writes it -----------------------------------------------------------------
+
+# core/loops.ts UNSAFE: control characters, lone surrogate halves, line and paragraph separators, bidi controls.
+UNSAFE_RE = re.compile("[\x00-\x1f\x7f-\x9f\ud800-\udfff\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+# JavaScript's \s, which the TypeScript side collapses and trims.
+JS_SPACE = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+SPACE_RE = re.compile(f"[{JS_SPACE}]+")
+ID_DROP_RE = re.compile(f"[|,{JS_SPACE}]")
+TEXT_CAPS = {"title": 120, "summary": 300, "note": 300, "reason": 200, "owner": NAME_CAP, "channel": NAME_CAP, "by_name": NAME_CAP}
+ID_FIELDS = {"key", "client", "type", "channel_id", "opened", "closed", "resolved", "until", "by_user", "by_message"}
 
 
 def sanitise(text, limit=None) -> str:
-    """No `|`, no line breaks or control characters, whitespace collapsed, cut to `limit` characters."""
+    """core/loops.ts sanitise(): every `|` removed; control, separator and bidi characters to spaces; whitespace
+    collapsed and trimmed; cut to `limit` code points and trimmed again. No limit: not cut (for the post only)."""
     s = "" if text is None else str(text)
-    s = "".join(" " if unicodedata.category(c) in ("Cc", "Zl", "Zp") else c for c in s).replace("|", "")
-    s = re.sub(r"\s+", " ", s).strip()
-    if limit and len(s) > limit:
-        s = s[: limit - 1].rstrip() + "…"
-    return s
+    s = SPACE_RE.sub(" ", UNSAFE_RE.sub(" ", s.replace("|", ""))).strip(" ")
+    return s if limit is None else s[: max(0, limit)].strip(" ")
+
+
+def clean_id(v) -> str:
+    """core/loops.ts cleanId(): an id, key, code or time; nothing unsafe, no `|`, comma or whitespace; 100 code points."""
+    s = "" if v is None else str(v)
+    return ID_DROP_RE.sub("", UNSAFE_RE.sub("", s))[:ID_CAP]
+
+
+def clean_evidence(ids) -> list:
+    """core/loops.ts cleanEvidence(): cleaned, blanks and repeats dropped (first sighting keeps its place), last 8."""
+    out = []
+    for i in ids if isinstance(ids, list) else []:
+        c = clean_id(i)
+        if c and c not in out:
+            out.append(c)
+    return out[-MAX_EVIDENCE:]
 
 
 def evidence_list(ids) -> list:
-    """Message ids, unique, oldest to newest, the newest MAX_EVIDENCE kept."""
-    uniq = {str(i).strip() for i in (ids or []) if str(i).strip().isdigit()}
-    return sorted(uniq, key=int)[-MAX_EVIDENCE:]
+    """What the job writes: message ids in snowflake (time) order, the newest eight."""
+    digits = {clean_id(i) for i in (ids or [])}
+    return clean_evidence(sorted((d for d in digits if d.isdigit()), key=int))
+
+
+def c1_field(name: str, value):
+    """One C1 field as core/loops.ts writes it, for the shared fixture (plan v3.1 row 18)."""
+    if name in TEXT_CAPS:
+        return sanitise(value, TEXT_CAPS[name])
+    if name == "reopened":
+        c = clean_id(value)
+        return "-" if c in ("", "-") else c
+    if name in ID_FIELDS:
+        return clean_id(value)
+    if name == "evidence":
+        return clean_evidence(value)
+    raise KeyError(f"no C1 field {name!r}")
 
 
 def compose(tag: str, pairs) -> str:
@@ -166,23 +257,23 @@ def compose(tag: str, pairs) -> str:
 
 def open_line(f: dict) -> str:
     return compose("OPEN/1", [
-        ("key", sanitise(f["key"])),
-        ("client", sanitise(f.get("client")) or "internal"),
-        ("type", sanitise(f.get("type"))),
-        ("owner", sanitise(f.get("owner")) or "unclear"),
-        ("channel", sanitise(f.get("channel"))),
-        ("channel_id", sanitise(f.get("channel_id"))),
-        ("opened", sanitise(f.get("opened"))),
-        ("reopened", sanitise(f.get("reopened")) or "-"),
+        ("key", clean_id(f["key"])),
+        ("client", clean_id(f.get("client"))),
+        ("type", clean_id(f.get("type"))),
+        ("owner", sanitise(f.get("owner"), NAME_CAP)),
+        ("channel", sanitise(f.get("channel"), NAME_CAP)),
+        ("channel_id", clean_id(f.get("channel_id"))),
+        ("opened", clean_id(f.get("opened"))),
+        ("reopened", c1_field("reopened", f.get("reopened"))),
         ("title", sanitise(f.get("title"), 120)),
         ("summary", sanitise(f.get("summary"), 300)),
-        ("evidence", ",".join(evidence_list(f.get("evidence")))),
+        ("evidence", ",".join(clean_evidence(list(f.get("evidence") or [])))),
     ])
 
 
 def closed_line(key, by_message, closed, reason) -> str:
-    return compose("CLOSED/1", [("key", sanitise(key)), ("by_message", sanitise(by_message)),
-                                ("closed", sanitise(closed)), ("reason", sanitise(reason, 200))])
+    return compose("CLOSED/1", [("key", clean_id(key)), ("by_message", clean_id(by_message)),
+                                ("closed", clean_id(closed)), ("reason", sanitise(reason, 200))])
 
 
 OPEN_FIELDS = ("key", "client", "type", "owner", "channel", "channel_id", "opened", "reopened", "title", "summary", "evidence")
@@ -206,6 +297,11 @@ def read_line(claim):
     return m.group(1), fields
 
 
+def esc(s) -> str:
+    """Model text made inert in a Discord post, as the PA's esc() does."""
+    return re.sub(r"([\\*_~`|>#\[\]()<@])", r"\\\1", str(s or ""))
+
+
 # --- HTTP -----------------------------------------------------------------------------------------------------
 
 
@@ -217,17 +313,24 @@ def _request(method: str, url: str, *, headers=None, body=None) -> urllib.reques
     return req
 
 
-def http_text(req: urllib.request.Request, label: str):
+def http_text(req: urllib.request.Request, label: str, cap: float = HTTP_TIMEOUT):
+    timeout = budget(cap)
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read().decode("utf-8"), r.headers
     except urllib.error.HTTPError as e:
         try:
             detail = e.read().decode("utf-8", "replace") if e.fp else ""
         finally:
             e.close()
-        raise JobError(f"{label} answered {e.code}: {one_line(detail)[:200]}") from None
-    except (urllib.error.URLError, OSError) as e:
+        raise HttpFailure(f"{label} answered {e.code}: {one_line(detail)[:200]}", e.code, detail, e.headers) from None
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise RequestTimeout(f"{label} timed out after {timeout:.0f} s") from None
+        raise JobError(f"{label} unreachable: {type(e).__name__}: {e}") from None
+    except TimeoutError:
+        raise RequestTimeout(f"{label} timed out after {timeout:.0f} s") from None
+    except OSError as e:
         raise JobError(f"{label} unreachable: {type(e).__name__}: {e}") from None
 
 
@@ -288,13 +391,32 @@ class Grysstof:
         return self.get("/pulse/overview")
 
     def loops(self) -> dict:
-        d = self.get("/loops", state="all", limit=LOOPS_LIMIT)
-        if not isinstance(d.get("loops"), list):
-            raise JobError("/browse/api/loops answered without a loops list")
-        total = d.get("total")
-        if isinstance(total, int) and total > len(d["loops"]):
-            raise JobError(f"/browse/api/loops returned {len(d['loops'])} of {total} loops; refusing a cut-off list")
-        return d
+        """Every loop in every state, paged by offset. A repeated page restarts the read once, then fails."""
+        for attempt in (1, 2):
+            out, keys, offset, first, repeated = [], set(), 0, None, False
+            while True:
+                d = self.get("/loops", state="all", limit=LOOPS_PAGE, offset=offset)
+                page = d.get("loops")
+                if not isinstance(page, list):
+                    raise JobError("/browse/api/loops answered without a loops list")
+                first = first or d
+                page_keys = [str(lp.get("key")) for lp in page if isinstance(lp, dict)]
+                if any(k in keys for k in page_keys):
+                    repeated = True
+                    break
+                keys.update(page_keys)
+                out.extend(page)
+                total = d.get("total")
+                if len(page) < LOOPS_PAGE or (isinstance(total, int) and len(out) >= total):
+                    break
+                offset += len(page)
+            if not repeated:
+                total = first.get("total")
+                if isinstance(total, int) and len(out) < total:
+                    raise JobError(f"/browse/api/loops gave {len(out)} of {total} loops; refusing a cut-off list")
+                return {"loops": out, "unreadable": first.get("unreadable") or [], "warnings": first.get("warnings") or {}, "total": total}
+            log("loops.repeated_page", err=True, offset=offset, attempt=attempt)
+        raise JobError("/browse/api/loops repeated a page twice (does the route take offset?); refusing a list with loops counted twice")
 
     def history(self, subject: str) -> list:
         facts = self.get("/history", subject=subject).get("facts")
@@ -317,30 +439,57 @@ class Grysstof:
 
 
 def read_window(g: Grysstof, since: str) -> list:
-    """Every Discord thought since `since`, oldest first, paged by offset until a short page."""
-    out, seen, offset = [], set(), 0
-    while True:
-        page = g.thoughts(since, offset, PAGE)
-        if len(page) > PAGE:
-            raise JobError(f"/browse/api/thoughts returned {len(page)} rows for a page of {PAGE}")
-        if page and str(page[0].get("id")) in seen:
-            raise JobError(f"/browse/api/thoughts repeated a page at offset {offset}; refusing to loop")
-        seen.update(str(t.get("id")) for t in page)
-        out.extend(page)
-        if len(out) >= WINDOW_CAP:
-            raise JobError(f"the {DAYS}-day window holds {WINDOW_CAP} or more messages; refusing to build a cut-off transcript")
-        if len(page) < PAGE:
-            return out
-        offset += len(page)
+    """Every Discord thought since `since`, oldest first, paged by offset until a short page. WINDOW_CAP is the
+    total over all pages. Messages moving under the read (a backfill) repeat a page: read again from the start, once."""
+    for attempt in (1, 2):
+        out, seen, offset, repeated = [], set(), 0, False
+        while True:
+            page = g.thoughts(since, offset, PAGE)
+            if len(page) > PAGE:
+                raise JobError(f"/browse/api/thoughts returned {len(page)} rows for a page of {PAGE}")
+            ids = [str(t.get("id")) for t in page]
+            if any(i in seen for i in ids):
+                repeated = True
+                break
+            seen.update(ids)
+            out.extend(page)
+            if len(out) >= WINDOW_CAP:
+                raise JobError(f"the {DAYS}-day window holds {WINDOW_CAP} or more messages in total; refusing to build a cut-off transcript")
+            if len(page) < PAGE:
+                return out
+            offset += len(page)
+        log("window.repeated_page", err=True, offset=offset, attempt=attempt, detail="messages moved while reading; reading again from the start")
+    raise JobError("/browse/api/thoughts repeated a page twice; refusing a transcript with messages counted twice")
 
 
 def send(webhook: str, text: str) -> int:
+    """The post, in chunks. A 429 waits for Discord's retry_after and tries again (WEBHOOK_TRIES in all)."""
     parts = chunks(text)
     for part in parts:
-        req = _request("POST", webhook + "?wait=true", headers={"User-Agent": "open-loops/2.0"},
-                       body={"content": part, "allowed_mentions": {"parse": []}})
-        http_text(req, "webhook")
+        for attempt in range(1, WEBHOOK_TRIES + 1):
+            req = _request("POST", webhook + "?wait=true", headers={"User-Agent": "open-loops/2.0"},
+                           body={"content": part, "allowed_mentions": {"parse": []}})
+            try:
+                http_text(req, "webhook")
+                break
+            except HttpFailure as e:
+                if e.code != 429 or attempt == WEBHOOK_TRIES:
+                    raise
+                wait = retry_after(e)
+                log("webhook.rate_limited", err=True, wait=wait, attempt=attempt)
+                sleep(wait)
     return len(parts)
+
+
+def retry_after(e: HttpFailure) -> float:
+    try:
+        wait = float(json.loads(e.body or "{}").get("retry_after"))
+    except (ValueError, TypeError, AttributeError):
+        try:
+            wait = float((e.headers or {}).get("Retry-After"))
+        except (ValueError, TypeError):
+            wait = 1.0
+    return min(MAX_RETRY_AFTER, max(0.0, wait))
 
 
 def chunks(text: str) -> list:
@@ -420,6 +569,11 @@ def load(thoughts: list, portal_sources: set) -> list:
     return msgs
 
 
+def slug(c) -> str:
+    s = str(c or "").strip().casefold()
+    return s[len("client:"):] if s.startswith("client:") else s
+
+
 def client_map(pulse: dict) -> dict:
     """Channel name (case-folded) to client slug, or None for a channel that is not a client's."""
     out = {}
@@ -428,8 +582,14 @@ def client_map(pulse: dict) -> dict:
             continue
         ch = str(row.get("channel") or "").strip().lstrip("#").casefold()
         c = row.get("client")
-        out[ch] = c[len("client:"):] if isinstance(c, str) and c.startswith("client:") else None
+        out[ch] = slug(c) if isinstance(c, str) and c.startswith("client:") else None
     return out
+
+
+def known_clients(pulse: dict) -> set:
+    """Every client the server knows: a card per client subject, and every mapped channel's client."""
+    cards = {slug(c.get("client")) for c in pulse.get("cards") or [] if isinstance(c, dict) and c.get("client")}
+    return {c for c in cards | set(client_map(pulse).values()) if c}
 
 
 def transcript(msgs: list, mapping: dict) -> str:
@@ -474,7 +634,7 @@ def parse_members(raw) -> Members:
 SYSTEM = """You keep the list of OPEN LOOPS for a software company's Discord channels (client-support and internal channels).
 An open loop is something raised in the messages that nothing afterwards in the messages closes.
 
-You get the loops already recorded as open, each with a key, and the messages of the last seven days, each with an id like m12.
+You get the loops already recorded as open (each with a key), the loops already finished whose first message is in this window (each with a key), the list of known clients, and the messages of the last seven days, each with an id like m12.
 
 Another tool already reports unanswered asks. Messages it reports are marked "⚑portal". NEVER report a new loop that uses a ⚑portal message as evidence. Report as new only what that tool cannot see:
 (a) someone responded (a reply, a reaction, a partial answer) but a concrete deliverable, decision or answer is still owed;
@@ -486,12 +646,14 @@ Loop types:
 - stale_followup: an item said to be waiting ("lets see if we get a reply", "hopefully next week", "will update") where time has passed with no further message.
 - unticketed_ask: a client or colleague asks for a change or fix and nothing shows it was logged or scheduled.
 
-For each recorded loop, say what the messages show, under "existing":
+For each recorded open loop, say what the messages show, under "existing":
 - still_open: nothing in the messages closes it. You may leave a still-open loop out.
 - closed_by: a later message in the same channel answers it, does it, or clearly takes ownership. Give that message's id in "message".
 - owner_now: the person or role it waits on has clearly changed. Give the new owner in "owner" and the message that shows it in "message".
 - evidence_add: newer messages are about the same loop and it is still open. List their ids in "evidence".
-Use only the keys given. Never report a recorded loop under "new".
+Use only the keys given. Never report a recorded open loop under "new".
+
+For a finished loop: if a message raises that same thing again, report it under "new" with that loop's "key". A different thing owed in the same message is a new loop without "key".
 
 Rules:
 1. Use ONLY the messages given. Every claim must cite the message ids that show it. Never invent an id or a fact.
@@ -501,15 +663,15 @@ Rules:
 4b. Never mention message ids (m12 etc.) inside title, summary or why_open. Ids go only in "evidence" and "message".
 5. 'owner' is the person or role the loop is waiting on, only if the messages make that clear; otherwise "unclear".
 6. One loop per distinct thing owed. A message holding two asks gives two loops, each citing that message.
-7. For a new loop, cite the message that raised it and the messages that show it is still open. Do not cite earlier messages as background: the oldest message you cite is taken as the one that raised the loop.
-8. "client" is the client named in the channel's header, or null.
+7. A loop lives in one channel: "channel" names it, and every message in "evidence" comes from that channel (a thread counts as its channel). Cite the message that raised it and the messages that show it is still open; do not cite earlier messages as background: the oldest message you cite is taken as the one that raised the loop.
+8. "client" is the client the messages are about, from the list of known clients given with the messages, or null.
 9. Order new loops by how much it matters to a client relationship: client-facing channels and client-visible deliverables first.
 10. Return at most 15 new loops. Fewer is fine. If nothing is open, return empty lists. Do not pad.
 11. Answer once. Return exactly one JSON object and nothing before or after it.
 
 Return ONLY JSON in this shape:
 {"existing":[{"key":"as given","status":"still_open|closed_by|owner_now|evidence_add","message":"m12","owner":"name","evidence":["m3"]}],
- "new":[{"channel":"name","client":"slug or null","type":"unanswered_question|unkept_promise|stale_followup|unticketed_ask","title":"at most 8 words, names the thing owed, e.g. Azure 6498 update for Swanzo","summary":"one plain sentence","owner":"name or unclear","evidence":["m4","m9"],"why_open":"one sentence on what is missing"}]}"""
+ "new":[{"key":"only when it re-reports a recorded loop","channel":"name","client":"slug or null","type":"unanswered_question|unkept_promise|stale_followup|unticketed_ask","title":"at most 8 words, names the thing owed, e.g. Azure 6498 update for Swanzo","summary":"one plain sentence","owner":"name or unclear","evidence":["m4","m9"],"why_open":"one sentence on what is missing"}]}"""
 
 
 def state_of(lp: dict) -> str:
@@ -525,10 +687,31 @@ def newest_first(loops: list) -> list:
     return sorted(loops, key=lambda lp: (activity(lp), str(lp.get("key"))), reverse=True)
 
 
-def model_input(now: datetime, msgs: list, offered: list, not_offered: int, mapping: dict) -> str:
+def split_key(key):
+    m = KEY_RE.match(str(key or ""))
+    return (m.group(1), m.group(2) or "", int(m.group(3) or 1)) if m else None
+
+
+def finish_time(lp: dict):
+    """When a finished loop finished. A RESOLVED line's claimed time is trusted no later than when the ledger learned
+    it (a wrong clock or a hand-written future time must not decide suppression); CLOSED keeps the message's time."""
+    claimed, learned = parse_time(lp.get("closed")), parse_time(lp.get("learnedAt"))
+    if state_of(lp) == "resolved":
+        known = [t for t in (claimed, learned) if t]
+        return min(known) if known else None
+    return claimed or learned
+
+
+def finished_in_window(loops: list, msgs: list) -> list:
+    ids = {m["msg_id"] for m in msgs}
+    return sorted((lp for lp in loops if isinstance(lp, dict) and state_of(lp) in ("closed", "resolved")
+                   and (split_key(lp.get("key")) or ("",))[0] in ids), key=lambda lp: str(lp.get("key")))
+
+
+def model_input(now: datetime, msgs: list, offered: list, not_offered: int, mapping: dict, finished=(), clients=()) -> str:
     by_msg = {m["msg_id"]: m["id"] for m in msgs}
     lines = [f"Now is {now:%A %d %B %Y %H:%M} SAST.", "",
-             'Loops already recorded as open (attach to these by key; never report one of them under "new"):']
+             'Loops already recorded as open (attach to these by key under "existing"; never report one of them under "new"):']
     for lp in offered:
         ev = evidence_list(lp.get("evidence"))
         known = [by_msg[e] for e in ev if e in by_msg]
@@ -544,19 +727,31 @@ def model_input(now: datetime, msgs: list, offered: list, not_offered: int, mapp
         lines.append("(none)")
     if not_offered:
         lines.append(f"({not_offered} older open loops are not listed; do not report them.)")
-    lines += ["", "Messages (oldest first within each channel):", transcript(msgs, mapping)]
+    lines += ["", 'Loops already finished whose first message is in this window (if a message raises one of these again, '
+                  'report it under "new" with its "key"):']
+    for lp in finished:
+        done = finish_time(lp)
+        lines.append(" · ".join([f"- key {lp.get('key')}", sanitise(lp.get("title"), 120), f"#{sanitise(lp.get('channel'))}",
+                                 f"{state_of(lp)}" + (f" {done.astimezone(SAST):%a %d %b %H:%M}" if done else "")]))
+    if not finished:
+        lines.append("(none)")
+    lines += ["", f"Clients: {', '.join(sorted(clients)) or '(none known)'}", "",
+              "Messages (oldest first within each channel):", transcript(msgs, mapping)]
     return "\n".join(lines)
 
 
-def ask_model(api_key: str, user: str) -> tuple:
-    """One streamed Messages call; the text of the answer and the token usage. Anything off raises ModelError."""
-    body = {"model": MODEL, "max_tokens": MAX_TOKENS, "system": SYSTEM, "stream": True,
+def stream_messages(api_key: str, model: str, system: str, user: str) -> tuple:
+    """One streamed Messages call: the answer's text and the token usage. Anything off raises ModelError."""
+    body = {"model": model, "max_tokens": MAX_TOKENS, "system": system, "stream": True,
             "messages": [{"role": "user", "content": user}]}
     req = _request("POST", ANTHROPIC_URL, headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"}, body=body)
     parts, usage, stop, done = [], {}, None, False
     try:
-        with urllib.request.urlopen(req, timeout=MODEL_IDLE_TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=budget(MODEL_IDLE_TIMEOUT)) as r:
             for raw in r:
+                left = remaining()
+                if left is not None and left <= 0:
+                    raise ModelError(f"the model pass ran past the run's {DEADLINE_SECONDS} s deadline")
                 line = raw.decode("utf-8").strip()
                 if not line.startswith("data:"):
                     continue
@@ -577,7 +772,10 @@ def ask_model(api_key: str, user: str) -> tuple:
                     e = ev.get("error") or {}
                     raise ModelError(f"model stream error {e.get('type')}: {e.get('message')}")
     except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", "replace") if e.fp else ""
+        try:
+            detail = e.read().decode("utf-8", "replace") if e.fp else ""
+        finally:
+            e.close()
         raise ModelError(f"model answered {e.code}: {one_line(detail)[:200]}") from None
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise ModelError(f"model call failed: {type(e).__name__}: {e}") from None
@@ -586,6 +784,23 @@ def ask_model(api_key: str, user: str) -> tuple:
     if stop not in ("end_turn", "stop_sequence"):
         raise ModelError(f"model stopped with {stop}")
     return "".join(parts), usage
+
+
+def anthropic_provider(env: dict):
+    """The one model provider today. Returns ask(system, user) -> text."""
+    key, model = env.get("ANTHROPIC_API_KEY", ""), env.get("OPEN_LOOPS_MODEL") or DEFAULT_MODEL
+
+    def ask(system: str, user: str) -> str:
+        text, usage = stream_messages(key, model, system, user)
+        log("model.ok", provider="anthropic", model=model, tokens_in=usage.get("input_tokens"), tokens_out=usage.get("output_tokens"))
+        return text
+
+    return ask
+
+
+# The model port: provider name -> factory(env) -> ask(system, user) -> text (raises ModelError).
+PROVIDERS = {"anthropic": anthropic_provider}
+PROVIDER_SETTINGS = {"anthropic": ("ANTHROPIC_API_KEY",)}
 
 
 def parse_model(raw: str) -> dict:
@@ -609,19 +824,19 @@ def parse_model(raw: str) -> dict:
     return found
 
 
-# --- C2 and C5 in code ----------------------------------------------------------------------------------------
+# --- C2 and C5 in code (the job owns these rules, plan v3.1) --------------------------------------------------
 
 
 @dataclass
 class Write:
-    kind: str                 # open | update | close
+    kind: str                 # open | update | close | unpark
     key: str
     claim: str
     supersedes: str | None
     source: str
     proof: str
     occurred_at: str
-    record: dict              # the loop as it reads after this line, for the post
+    record: dict              # the loop as it reads after this line, for the dry run's post
     closer: dict | None = None
 
 
@@ -640,9 +855,9 @@ def strip_ids(s) -> str:
     return re.sub(r"\s*\(?\bm\d+\b(?:\s*,\s*m\d+)*\)?", "", str(s or "")).strip()
 
 
-def split_key(key):
-    m = KEY_RE.match(str(key))
-    return (m.group(1), m.group(2) or "", int(m.group(3) or 1)) if m else None
+def norm_title(s) -> str:
+    """A title for matching: case, punctuation and spacing ignored."""
+    return " ".join(re.findall(r"\w+", str(s or "").casefold()))
 
 
 def opener_source(lp: dict) -> str:
@@ -650,16 +865,24 @@ def opener_source(lp: dict) -> str:
     return f"discord:{m.group(1)}/{m.group(2)}/{m.group(3)}" if m else ACTOR
 
 
+def same_channel(lp: dict, msg: dict):
+    """(in the loop's channel, only by name). Ids decide; a name only for a message captured before C4."""
+    lid = str(lp.get("channelId") or "")
+    if lid and lid in (msg["channel_id"], msg["parent_id"]):
+        return True, False
+    if (not msg["ids_known"] or not lid) and msg["channel"].casefold() == str(lp.get("channel") or "").casefold():
+        return True, True
+    return False, False
+
+
 def accept_close(lp: dict, msg: dict, members: Members):
     """C5: same channel, later than opened and reopened, written by a member. (ok, refusal reason, weak notes)."""
     notes = []
-    lid = str(lp.get("channelId") or "")
-    if lid and lid in (msg["channel_id"], msg["parent_id"]):
-        pass
-    elif not msg["ids_known"] and msg["channel"].casefold() == str(lp.get("channel") or "").casefold():
-        notes.append(f"close.weak key={lp['key']} reason=channel_by_name message={msg['id']}")
-    else:
+    inside, by_name = same_channel(lp, msg)
+    if not inside:
         return False, "wrong_channel", []
+    if by_name:
+        notes.append(f"close.weak key={lp['key']} reason=channel_by_name message={msg['id']}")
     opened, reopened = parse_time(lp.get("opened")), parse_time(lp.get("reopened"))
     if opened is None or msg["ts"] <= opened or (reopened is not None and msg["ts"] <= reopened):
         return False, "before_open", []
@@ -673,12 +896,8 @@ def accept_close(lp: dict, msg: dict, members: Members):
     return True, "", notes
 
 
-def finish_time(lp: dict):
-    return parse_time(lp.get("closed")) or parse_time(lp.get("learnedAt"))
-
-
 def check_new(n, by_mid: dict, now: datetime, plan: Plan):
-    """The Pi script's checks, unchanged in spirit: real ids, no portal message, a known type, old enough."""
+    """Real ids; evidence only from the channel the model names (row 3); no portal message; a known type; old enough."""
     if not isinstance(n, dict):
         plan.counts["bad_entry"] += 1
         return None
@@ -686,7 +905,15 @@ def check_new(n, by_mid: dict, now: datetime, plan: Plan):
     if not isinstance(ids, list) or not ids or any(str(e) not in by_mid for e in ids):
         plan.counts["bad_id"] += 1
         return None
-    ev = list({by_mid[str(e)]["id"]: by_mid[str(e)] for e in ids}.values())
+    cited = list({by_mid[str(e)]["id"]: by_mid[str(e)] for e in ids}.values())
+    channel = str(n.get("channel") or "").strip().lstrip("#").casefold()
+    ev = [m for m in cited if m["channel"].casefold() == channel]
+    if len(ev) < len(cited):
+        plan.counts["cross_channel"] += len(cited) - len(ev)
+        plan.notes.append(f"new.cross_channel channel={channel or '-'} dropped={','.join(m['id'] for m in cited if m not in ev)}")
+    if not ev:
+        plan.counts["bad_channel"] += 1
+        return None
     if any(m["portal"] for m in ev):
         plan.counts["on_portal"] += 1
         return None
@@ -704,20 +931,21 @@ def check_new(n, by_mid: dict, now: datetime, plan: Plan):
         return None
     owner = str(n.get("owner") or "").strip()
     return {"title": title, "summary": summary, "type": kind, "owner": "unclear" if is_unclear(owner) else owner,
-            "client": n.get("client"), "ev": ev, "opener": min(ev, key=lambda m: (m["ts"], int(m["msg_id"])))}
+            "client": n.get("client"), "ev": ev, "opener": min(ev, key=lambda m: (m["ts"], int(m["msg_id"]))),
+            "key": str(n.get("key") or "").strip() or None}
 
 
-def classify(out, msgs: list, loops_reply: dict, members: Members, mapping: dict, now: datetime, offered=None) -> Plan:
+def classify(out, msgs: list, loops_reply: dict, members: Members, mapping: dict, now: datetime, offered=None, clients=None) -> Plan:
     """The model's answer, checked against the record and the messages, as the lines to write. Pure."""
     out = out or {}
     plan = Plan()
     loops = [lp for lp in (loops_reply or {}).get("loops") or [] if isinstance(lp, dict) and lp.get("key")]
     by_key = {str(lp["key"]): lp for lp in loops}
-    unreadable = [split_key(str(u.get("subject", ""))[len("loop:"):]) for u in (loops_reply or {}).get("unreadable") or []
-                  if isinstance(u, dict) and str(u.get("subject", "")).startswith("loop:")]
+    unreadable = {k[0] for k in (split_key(str(u.get("subject", ""))[len("loop:"):])
+                                 for u in (loops_reply or {}).get("unreadable") or [] if isinstance(u, dict)) if k}
     by_mid = {m["id"]: m for m in msgs}
     offered = set(offered) if offered is not None else {k for k, lp in by_key.items() if state_of(lp) == "open"}
-    known_clients = {c for c in mapping.values() if c}
+    known = {slug(c) for c in (clients or ())} | {c for c in mapping.values() if c}
     closes = {}                                                   # key -> closing message
     changes = defaultdict(lambda: {"owner": None, "evidence": [], "touched": []})
 
@@ -767,61 +995,95 @@ def classify(out, msgs: list, loops_reply: dict, members: Members, mapping: dict
         else:
             plan.counts["bad_status"] += 1
 
-    groups = defaultdict(list)
-    for n in out.get("new") or []:
-        item = check_new(n, by_mid, now, plan)
-        if item:
-            groups[item["opener"]["msg_id"]].append(item)
-
-    def heads(opener_id: str) -> dict:
-        """Letter (or "") -> the newest generation of that loop for this opener."""
-        best = {}
+    def family(opener_id: str) -> dict:
+        """Letter (or "") -> (newest generation, its number, every title in that letter's line) for this opener."""
+        out_ = {}
         for lp in loops:
             k = split_key(lp["key"])
-            if k and k[0] == opener_id and (k[1] not in best or k[2] > best[k[1]][1]):
-                best[k[1]] = (lp, k[2])
-        return best
+            if not k or k[0] != opener_id:
+                continue
+            head, gen, titles = out_.get(k[1], (None, 0, set()))
+            titles.add(norm_title(lp.get("title")))
+            out_[k[1]] = (lp, k[2], titles) if k[2] > gen else (head, gen, titles)
+        return out_
 
-    def closed_at(lp: dict):
+    def finished_at(lp: dict):
         if lp["key"] in closes:
             return closes[lp["key"]]["ts"]
         return finish_time(lp) if state_of(lp) in ("closed", "resolved") else None
 
-    opens = []
-    for opener_id in sorted(groups, key=int):
-        fam = heads(opener_id)
-        kept = []
-        for it in groups[opener_id]:  # C2 rule 2, first branch: a re-sighting of a finished loop is suppressed
-            finished = [closed_at(lp) for lp, _ in fam.values()]
-            if any(ct is not None and all(m["ts"] <= ct for m in it["ev"]) for ct in finished):
+    opens = {}  # key -> {"it": item, "opened": time}
+
+    def add_open(key: str, it: dict, opened: datetime) -> None:
+        if key in opens:
+            have = opens[key]
+            have["it"]["ev"] += [m for m in it["ev"] if m not in have["it"]["ev"]]
+            have["opened"] = min(have["opened"], opened)
+        else:
+            opens[key] = {"it": {**it, "ev": list(it["ev"])}, "opened": opened}
+
+    attached, free = [], defaultdict(list)
+    for n in out.get("new") or []:
+        it = check_new(n, by_mid, now, plan)
+        if not it:
+            continue
+        target = None
+        if it["key"]:  # the model says which recorded loop this is (row 2)
+            k = split_key(it["key"])
+            if it["key"] in by_key and k:
+                target = (k[0], k[1])
+            else:
+                plan.counts["unknown_key_new"] += 1
+                plan.notes.append(f"new.unknown_key key={it['key']}")
+        if not target:  # else by title, within the family of the item's own opener (row 1)
+            nt, opener_id = norm_title(it["title"]), it["opener"]["msg_id"]
+            target = next(((opener_id, letter) for letter, (_, _, titles) in sorted(family(opener_id).items()) if nt and nt in titles), None)
+        if target:
+            attached.append((it, target))
+        else:
+            free[it["opener"]["msg_id"]].append(it)
+
+    for it, (opener_id, letter) in attached:
+        head, gen, _ = family(opener_id)[letter]
+        base = opener_id + (f":{letter}" if letter else "")
+        done = finished_at(head)
+        if done is None and state_of(head) == "open":      # C2 rule 1: a re-sighting adds evidence
+            changes[head["key"]]["evidence"].extend(it["ev"])
+            plan.counts["resighted_open"] += 1
+        elif done is None and state_of(head) == "parked":  # C2 rule 1: parked stays parked, nothing written
+            plan.counts["resighted_parked"] += 1
+        elif done is not None:                              # C2 rule 2, for the loop it attached to only
+            later = [m for m in it["ev"] if m["ts"] > done]
+            if later:
+                add_open(f"{base}:{gen + 1}", it, min(m["ts"] for m in later))
+            else:
                 plan.counts["resighted_closed"] += 1
-                plan.notes.append(f"new.resighted_closed opener={opener_id} title={json.dumps(it['title'], ensure_ascii=False)}")
+                plan.notes.append(f"new.resighted_closed key={head['key']} title={json.dumps(it['title'], ensure_ascii=False)}")
+        else:
+            plan.counts["unknown_state"] += 1
+            plan.notes.append(f"new.unknown_state key={head['key']} state={head.get('state')}")
+
+    for opener_id in sorted(free, key=int):
+        items = sorted(free[opener_id], key=lambda it: (it["title"].casefold(), it["title"]))
+        if opener_id in unreadable:
+            plan.counts["unreadable_conflict"] += len(items)
+            plan.notes.append(f"new.unreadable_conflict opener={opener_id} items={len(items)}")
+            continue
+        merged = {}
+        for it in items:  # two items with one title are one loop
+            nt = norm_title(it["title"])
+            if nt in merged:
+                merged[nt]["ev"] += [m for m in it["ev"] if m not in merged[nt]["ev"]]
             else:
-                kept.append(it)
-        kept.sort(key=lambda it: (it["title"].casefold(), it["title"]))  # C2 rule 3: title order
-        for i, it in enumerate(kept):
-            letter = "" if i == 0 else chr(ord("a") + i)
-            base = opener_id + (f":{letter}" if letter else "")
-            if any(u and u[0] == opener_id and u[1] == letter for u in unreadable):
-                plan.counts["unreadable_conflict"] += 1
-                plan.notes.append(f"new.unreadable_conflict key={base}")
+                merged[nt] = {**it, "ev": list(it["ev"])}
+        taken = set(family(opener_id)) | {split_key(k)[1] for k in opens if split_key(k) and split_key(k)[0] == opener_id}
+        for it in merged.values():  # C2 rule 3: fresh letters, in title order, only the ones not in use (row 1)
+            letter = next((x for x in LETTERS if x not in taken), None)
+            if letter is None:
+                plan.counts["no_letter"] += 1
                 continue
-            if letter not in fam:
-                opens.append(new_open(base, it, it["opener"]["ts"], mapping, known_clients))
-                continue
-            head, gen = fam[letter]
-            ct = closed_at(head)
-            if ct is None and state_of(head) == "open":      # rule 1: a re-sighting adds evidence
-                changes[head["key"]]["evidence"].extend(it["ev"])
-                plan.counts["resighted_open"] += 1
-            elif ct is None and state_of(head) == "parked":  # rule 1: parked stays parked, nothing written
-                plan.counts["resighted_parked"] += 1
-            elif ct is not None:                              # rule 2, second branch: a new ask on the same opener
-                later = [m for m in it["ev"] if m["ts"] > ct]
-                opens.append(new_open(f"{base}:{gen + 1}", it, min(m["ts"] for m in later), mapping, known_clients))
-            else:
-                plan.counts["unknown_state"] += 1
-                plan.notes.append(f"new.unknown_state key={head['key']} state={head.get('state')}")
+            taken.add(letter)
+            add_open(opener_id + (f":{letter}" if letter else ""), it, it["opener"]["ts"])
 
     for key in sorted(closes):
         lp, msg = by_key[key], closes[key]
@@ -832,34 +1094,40 @@ def classify(out, msgs: list, loops_reply: dict, members: Members, mapping: dict
         if key in closes:
             continue
         lp, ch = by_key[key], changes[key]
+        good = []
+        for m in ch["evidence"]:
+            if same_channel(lp, m)[0]:
+                good.append(m)
+            else:
+                plan.counts["cross_channel"] += 1
+                plan.notes.append(f"evidence.cross_channel key={key} message={m['id']}")
         stored = evidence_list(lp.get("evidence"))
-        merged = evidence_list(list(lp.get("evidence") or []) + [m["msg_id"] for m in ch["evidence"]])
+        merged = evidence_list(list(lp.get("evidence") or []) + [m["msg_id"] for m in good])
         if merged == stored and not ch["owner"]:
             plan.counts["evidence_unchanged"] += 1
             continue
         fields = {"key": key, "client": lp.get("client"), "type": lp.get("type"), "owner": ch["owner"] or lp.get("owner"),
                   "channel": lp.get("channel"), "channel_id": lp.get("channelId"), "opened": lp.get("opened"),
                   "reopened": lp.get("reopened"), "title": lp.get("title"), "summary": lp.get("summary"), "evidence": merged}
-        touched = ch["evidence"] + ch["touched"]
-        at = max((m["ts"] for m in touched), default=now)
+        at = max((m["ts"] for m in good + ch["touched"]), default=now)
         record = {**lp, "owner": fields["owner"], "evidence": merged}
         plan.writes.append(Write("update", key, open_line(fields), lp.get("lineId"), opener_source(lp), str(lp.get("proof") or ""),
                                  iso(at), record))
-    plan.writes.extend(opens)
+    for key in sorted(opens):
+        plan.writes.append(new_open(key, opens[key]["it"], opens[key]["opened"], mapping, known))
     return plan
 
 
-def new_open(key: str, it: dict, opened: datetime, mapping: dict, known_clients: set) -> Write:
+def new_open(key: str, it: dict, opened: datetime, mapping: dict, known: set) -> Write:
     op = it["opener"]
-    model_client = it["client"] if isinstance(it["client"], str) and it["client"] in known_clients else None
+    model_client = slug(it["client"]) if isinstance(it["client"], str) and slug(it["client"]) in known else None
+    evidence = evidence_list([m["msg_id"] for m in it["ev"]])
     fields = {"key": key, "client": mapping.get(op["channel"].casefold()) or model_client or "internal", "type": it["type"],
               "owner": it["owner"], "channel": op["channel"], "channel_id": op["parent_id"] or op["channel_id"],
-              "opened": iso(opened), "reopened": None, "title": it["title"], "summary": it["summary"],
-              "evidence": [m["msg_id"] for m in it["ev"]]}
+              "opened": iso(opened), "reopened": None, "title": it["title"], "summary": it["summary"], "evidence": evidence}
     record = {"key": key, "state": "open", "client": fields["client"], "type": it["type"], "owner": it["owner"],
               "channel": op["channel"], "channelId": fields["channel_id"], "opened": fields["opened"], "reopened": None,
-              "title": sanitise(it["title"], 120), "summary": sanitise(it["summary"], 300),
-              "evidence": evidence_list(fields["evidence"]), "proof": op["link"]}
+              "title": sanitise(it["title"], 120), "summary": sanitise(it["summary"], 300), "evidence": evidence, "proof": op["link"]}
     return Write("open", key, open_line(fields), None, op["source"], op["link"], iso(opened), record)
 
 
@@ -878,8 +1146,17 @@ def until_of(lp: dict):
 
 
 def due_parked(loops: list, now: datetime) -> list:
-    return [lp for lp in loops if isinstance(lp, dict) and state_of(lp) == "parked"
-            and (until_of(lp) is not None and until_of(lp) <= now)]
+    due = []
+    for lp in loops:
+        if not isinstance(lp, dict) or state_of(lp) != "parked":
+            continue
+        until = until_of(lp)
+        if until is None:
+            log("unpark.bad_until", err=True, key=lp.get("key"), until=lp.get("until") or "-",
+                detail="not a date anyone can read; the loop stays parked until it is fixed")
+        elif until <= now:
+            due.append(lp)
+    return due
 
 
 def previous_open(facts: list, parked_id, key: str):
@@ -922,31 +1199,33 @@ def unpark_write(g: Grysstof, lp: dict, now: datetime) -> Write:
     proof = str(fact.get("proof") or lp.get("proof") or "")
     record = {**lp, "state": "open", "client": f["client"], "type": f["type"], "owner": f["owner"], "channel": f["channel"],
               "channelId": f["channel_id"], "opened": f["opened"], "reopened": reopened, "title": f["title"],
-              "summary": f["summary"], "evidence": evidence_list(evidence), "proof": proof,
+              "summary": f["summary"], "evidence": clean_evidence(evidence), "proof": proof,
               "until": None, "byUser": None, "byName": None, "note": None}
     return Write("unpark", str(lp["key"]), open_line(fields), lp.get("lineId"), opener_source({"proof": proof}), proof, iso(now), record)
 
 
 def unpark_due(g: Grysstof, loops: list, now: datetime, post: bool) -> tuple:
-    """Parked loops whose `until` has passed, back to OPEN. Returns the unpark writes that hold and the failures."""
-    done, failed = [], 0
+    """Parked loops whose `until` has passed, back to OPEN. Returns the unparks that hold and a Counter of the rest."""
+    done, stats = [], Counter()
     for lp in due_parked(loops, now):
         try:
             w = unpark_write(g, lp, now)
+        except (Terminated, DeadlineExceeded):
+            raise
         except JobError as e:
             log("unpark.failed", err=True, key=lp.get("key"), error=one_line(e)[:200])
-            failed += 1
+            stats["failed"] += 1
             continue
         if post:
             status, fid = write_line(g, w)
             if status != "ok":
-                failed += 1
+                stats[status] += 1
                 continue
             w.record["lineId"] = fid  # a close or update later in this run supersedes this line, not the PARKED one
         else:
             w.record["lineId"] = f"(after unpark of {lp.get('lineId')})"
         done.append(w)
-    return done, failed
+    return done, stats
 
 
 # --- writing --------------------------------------------------------------------------------------------------
@@ -958,18 +1237,40 @@ def landed(facts: list, w: Write):
 
 
 def write_line(g: Grysstof, w: Write) -> tuple:
-    """One capture_thought. On any failure, re-read the loop first: written already, changed by someone, or retry once.
-    Returns (status, the new line's id or None)."""
+    """One capture_thought. Returns (status, the new line's id or None); status is ok, failed, conflict or unknown.
+
+    A timeout may still land on the server, so it is never retried: pause, re-read once, and say "unknown" if the
+    line is not there yet. Any other failure re-reads too: written already (ok), changed by someone (conflict), or,
+    for a line that supersedes another, retried once. A line without `supersedes` is never retried (row 5)."""
     subject = f"loop:{w.key}"
     for attempt in (1, 2):
         try:
             fid = g.capture(w)
             log("write.ok", kind=w.kind, key=w.key, id=fid, attempt=attempt)
             return "ok", fid
+        except (Terminated, DeadlineExceeded):
+            raise
+        except RequestTimeout as e:
+            log("write.timeout", err=True, kind=w.kind, key=w.key, attempt=attempt, error=one_line(e)[:200])
+            sleep(REREAD_PAUSE)
+            try:
+                hit = landed(g.history(subject), w)
+            except Terminated:
+                raise
+            except JobError as e2:
+                log("write.reread_failed", err=True, key=w.key, error=one_line(e2)[:200])
+                hit = None
+            if hit:
+                log("write.landed_late", key=w.key, id=hit.get("id"))
+                return "ok", hit.get("id")
+            log("write.unknown", err=True, key=w.key, detail="timed out and not there on the re-read; not retried; check /loops")
+            return "unknown", None
         except JobError as e:
             log("write.failed", err=True, kind=w.kind, key=w.key, attempt=attempt, error=one_line(e)[:200])
         try:
             facts = g.history(subject)
+        except (Terminated, DeadlineExceeded):
+            raise
         except JobError as e:
             log("write.reread_failed", err=True, key=w.key, error=one_line(e)[:200])
             return "failed", None
@@ -977,25 +1278,33 @@ def write_line(g: Grysstof, w: Write) -> tuple:
         if hit:
             log("write.landed_despite_error", key=w.key, id=hit.get("id"))
             return "ok", hit.get("id")
-        if attempt == 2:
+        if not w.supersedes:
+            log("write.not_retried", err=True, key=w.key, detail="a line that supersedes nothing is never sent twice")
             return "failed", None
         head = next((f for f in facts if isinstance(f, dict) and not f.get("supersededBy")), None)
-        if (w.supersedes and (head is None or head.get("id") != w.supersedes)) or (not w.supersedes and facts):
-            log("write.conflict", err=True, key=w.key, detail="the loop changed since it was read; not retried",
-                expected=w.supersedes or "-", head=(head or {}).get("id", "-"))
+        if head is None or head.get("id") != w.supersedes:
+            log("write.conflict", key=w.key, detail="the loop changed since it was read; left as it is",
+                expected=w.supersedes, head=(head or {}).get("id", "-"))
             return "conflict", None
+        if attempt == 2:
+            return "failed", None
     return "failed", None
 
 
 def apply_plan(g: Grysstof, writes: list) -> tuple:
-    done, failed = [], 0
-    for w in writes:
-        status, _ = write_line(g, w)
+    done, stats = [], Counter()
+    for i, w in enumerate(writes):
+        try:
+            status, _ = write_line(g, w)  # every request's budget() raises DeadlineExceeded once the deadline has passed
+        except DeadlineExceeded:
+            stats["not_made"] += len(writes) - i
+            log("write.deadline", err=True, not_made=len(writes) - i, detail=f"the run reached its {DEADLINE_SECONDS} s deadline")
+            break
         if status == "ok":
             done.append(w)
         else:
-            failed += 1
-    return done, failed
+            stats[status] += 1
+    return done, stats
 
 
 def project(loops: list, applied: list) -> list:
@@ -1014,8 +1323,7 @@ def age_str(delta: timedelta) -> str:
 
 
 def md_title(lp: dict) -> str:
-    t = sanitise(lp.get("title"), 120) or sanitise(lp.get("summary"), 70) or str(lp.get("key"))
-    return t.replace("[", "(").replace("]", ")")
+    return esc(sanitise(lp.get("title"), 120) or sanitise(lp.get("summary"), 70) or str(lp.get("key")))
 
 
 def last_activity(lp: dict) -> datetime:
@@ -1031,22 +1339,26 @@ def link_of(lp: dict, links: dict) -> str:
     return str(lp.get("proof") or "")
 
 
+def plural(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
 def build_post(now: datetime, loops: list, *, closes=(), counts=None, model_failed=False, not_evaluated=0,
-               unreadable=0, write_failures=0, portal_ids=frozenset(), links=None) -> str:
-    counts, links = counts or {}, links or {}
-    open_ = newest_first([lp for lp in loops if state_of(lp) == "open"])
+               unreadable=0, stats=None, portal_ids=frozenset(), links=None) -> str:
+    counts, stats, links = counts or {}, stats or {}, links or {}
+    open_ = newest_first([lp for lp in loops if isinstance(lp, dict) and state_of(lp) == "open"])
     lines = [f"**Open loops** · {now:%a %d %b %Y} · {len(open_)} waiting"]
     if model_failed:
-        lines.append("⚠ **model pass failed; list may be stale.** This is the record as it stood before this run.")
+        lines.append("⚠ **model pass failed; list may be stale.** This is the record as the job found it.")
     for i, lp in enumerate(open_[:POST_CAP], 1):
         head = f"\n**{i}.** [{md_title(lp)}](<{link_of(lp, links)}>)"
         if str(lp.get("key")).split(":")[0] in portal_ids:
             lines.append(head + " · ⚑ also on the portal")
             continue
         lines.append(head)
-        lines.append(f"#{sanitise(lp.get('channel'))} · waiting on {sanitise(lp.get('owner')) or 'unclear'} · {age_str(now - last_activity(lp))}")
+        lines.append(f"#{esc(sanitise(lp.get('channel')))} · waiting on {esc(sanitise(lp.get('owner'))) or 'unclear'} · {age_str(now - last_activity(lp))}")
         if lp.get("summary"):
-            lines.append(sanitise(lp.get("summary"), 300))
+            lines.append(esc(sanitise(lp.get("summary"), 300)))
     if not open_:
         lines.append("\nNothing open. (If this reads empty for days, check the job rather than trust the calm.)")
     if len(open_) > POST_CAP:
@@ -1056,13 +1368,21 @@ def build_post(now: datetime, loops: list, *, closes=(), counts=None, model_fail
     if closes:
         lines.append("\n**Closed in channel this run**")
         for w in closes:
-            lines.append(f"- [{md_title(w.record)}](<{w.closer['link']}>) · #{sanitise(w.closer['channel'])}")
+            lines.append(f"- [{md_title(w.record)}](<{w.closer['link']}>) · #{esc(sanitise(w.closer['channel']))}")
     if counts.get("resighted_closed"):
         lines.append(f"\n_{counts['resighted_closed']} re-sightings of closed loops suppressed._")
     if unreadable:
         lines.append(f"_{unreadable} loop lines unreadable; see /loops._")
-    if write_failures:
-        lines.append(f"_{write_failures} ledger write{'' if write_failures == 1 else 's'} failed; this list may be out of date._")
+    if stats.get("conflict"):
+        lines.append(f"_{plural(stats['conflict'], 'loop', 'loops')} changed by someone else during the run; left as they are._")
+    if stats.get("failed"):
+        lines.append(f"_{plural(stats['failed'], 'ledger write', 'ledger writes')} failed; this list may be out of date._")
+    if stats.get("unknown"):
+        lines.append(f"_{plural(stats['unknown'], 'ledger write', 'ledger writes')} timed out; whether they landed is unknown (check /loops)._")
+    if stats.get("not_made"):
+        lines.append(f"_{plural(stats['not_made'], 'ledger write', 'ledger writes')} not made: the run reached its {DEADLINE_SECONDS} s deadline._")
+    if stats.get("reread_failed"):
+        lines.append("_/loops could not be read again after the writes; this list is the job's own view._")
     lines.append("\n_Reads Discord only. A loop closed in Azure DevOps, email, a call or in person still shows here._")
     lines.append("To resolve, press /loops in the Xactco server.")
     return "\n".join(lines)
@@ -1074,32 +1394,62 @@ def build_post(now: datetime, loops: list, *, closes=(), counts=None, model_fail
 def read_state(g: Grysstof, now: datetime) -> dict:
     pulse = g.pulse()
     portal = {str(le.get("source")) for le in pulse.get("looseEnds") or [] if isinstance(le, dict) and le.get("source")}
-    mapping = client_map(pulse)
     thoughts = read_window(g, iso(now - timedelta(days=DAYS)))
     msgs = load(thoughts, portal)
     lr = g.loops()
-    return {"portal": portal, "mapping": mapping, "thoughts": len(thoughts), "msgs": msgs, "loops": lr}
+    return {"portal": portal, "mapping": client_map(pulse), "clients": known_clients(pulse), "thoughts": len(thoughts),
+            "msgs": msgs, "loops": lr}
 
 
-def config(env: dict, post: bool) -> Members:
-    missing = [k for k in REQUIRED if not env.get(k)] + (["OPEN_LOOPS_WEBHOOK"] if post and not env.get("OPEN_LOOPS_WEBHOOK") else [])
+def provider_of(env: dict) -> str:
+    provider = (env.get("OPEN_LOOPS_MODEL_PROVIDER") or DEFAULT_PROVIDER).strip()
+    if provider not in PROVIDERS:
+        raise ConfigError(f"OPEN_LOOPS_MODEL_PROVIDER={provider} is not one of: {', '.join(sorted(PROVIDERS))}")
+    return provider
+
+
+def config(env: dict, post: bool) -> tuple:
+    provider = provider_of(env)
+    needed = list(BASE_SETTINGS) + list(PROVIDER_SETTINGS.get(provider, ())) + (["OPEN_LOOPS_WEBHOOK"] if post else [])
+    missing = [k for k in needed if not env.get(k)]
     if missing:
         raise ConfigError(f"missing from the env file: {', '.join(missing)}")
     members = parse_members(env["XACTCO_MEMBERS"])
     if not members.ids or not all(i.isdigit() for i in members.ids):
         raise ConfigError("XACTCO_MEMBERS must be comma-separated Discord user ids, each optionally id:Name")
-    return members
+    return members, PROVIDERS[provider](env)
+
+
+def fresh_loops(g: Grysstof, fallback: list, stats: Counter) -> tuple:
+    """The list the post is built from: /loops read now (row 7), or the job's own view if that read fails."""
+    try:
+        lr = g.loops()
+        return lr["loops"], len(lr.get("unreadable") or [])
+    except (Terminated,):
+        raise
+    except JobError as e:
+        log("post.reread_failed", err=True, error=one_line(e)[:200])
+        stats["reread_failed"] += 1
+        return fallback, None
 
 
 def run(env: dict, post: bool) -> int:
-    members = config(env, post)
+    members, ask = config(env, post)
     now = now_sast()
+    set_deadline(DEADLINE_SECONDS)
+    try:
+        return _run(env, post, members, ask, now)
+    finally:
+        set_deadline(None)
+
+
+def _run(env: dict, post: bool, members: Members, ask, now: datetime) -> int:
     g = Grysstof(env["GRYSSTOF_URL"], env["MCP_ACCESS_KEY"])
     s = read_state(g, now)
-    msgs, lr, mapping = s["msgs"], s["loops"], s["mapping"]
-    unparked, unpark_failures = unpark_due(g, lr["loops"], now, post)
+    msgs, lr, mapping, clients = s["msgs"], s["loops"], s["mapping"], s["clients"]
+    unparked, stats = unpark_due(g, lr["loops"], now, post)
     if post:
-        log("unparked", count=len(unparked), failed=unpark_failures)
+        log("unparked", count=len(unparked), **{k: v for k, v in sorted(stats.items())})
     else:
         print(f"would unpark {len(unparked)}")
         for w in unparked:
@@ -1112,49 +1462,60 @@ def run(env: dict, post: bool) -> int:
     offered = open_now[:MAX_OFFERED]
     not_evaluated = len(open_now) - len(offered)
     unreadable = len(lr.get("unreadable") or [])
+    finished = finished_in_window(lr["loops"], msgs)
     log("window", now=f"{now:%a %d %b %H:%M} SAST", thoughts=s["thoughts"], messages=len(msgs),
         channels=len({m["channel"] for m in msgs}), open_loops=len(open_now), offered=len(offered),
-        unreadable=unreadable, portal_loose_ends=len(s["portal"]))
+        finished_in_window=len(finished), unreadable=unreadable, portal_loose_ends=len(s["portal"]))
 
     try:
-        raw, usage = ask_model(env["ANTHROPIC_API_KEY"], model_input(now, msgs, offered, not_evaluated, mapping))
+        raw = ask(SYSTEM, model_input(now, msgs, offered, not_evaluated, mapping, finished, clients))
+        left = remaining()
+        if left is not None and left <= 0:
+            raise ModelError(f"the model pass ran past the run's {DEADLINE_SECONDS} s deadline")
         answer = parse_model(raw)
-    except ModelError as e:
+    except (ModelError, DeadlineExceeded) as e:
         log("model.failed", err=True, error=one_line(e)[:300])
-        text = build_post(now, lr["loops"], model_failed=True, not_evaluated=not_evaluated, unreadable=unreadable,
-                          write_failures=unpark_failures, portal_ids=portal_ids, links=links)
+        set_deadline(None)
+        loops_now, fresh_unreadable = fresh_loops(g, lr["loops"], stats) if post else (lr["loops"], None)
+        text = build_post(now, loops_now, model_failed=True, not_evaluated=not_evaluated,
+                          unreadable=unreadable if fresh_unreadable is None else fresh_unreadable,
+                          stats=stats, portal_ids=portal_ids, links=links)
         if post:
             log("posted", messages=send(env["OPEN_LOOPS_WEBHOOK"], text))
         else:
             print("--- DRY RUN: nothing written, nothing posted ---\n" + text)
         return 1
-    log("model.ok", tokens_in=usage.get("input_tokens"), tokens_out=usage.get("output_tokens"),
-        existing=len(answer["existing"]), new=len(answer["new"]))
+    log("model.answer", existing=len(answer["existing"]), new=len(answer["new"]))
 
-    plan = classify(answer, msgs, lr, members, mapping, now, {str(lp["key"]) for lp in offered})
+    plan = classify(answer, msgs, lr, members, mapping, now, {str(lp["key"]) for lp in offered}, clients=clients)
     for note in plan.notes:
         print(note)
     if plan.counts:
         log("checks", **{k: v for k, v in sorted(plan.counts.items())})
     by_kind = Counter(w.kind for w in plan.writes)
-    failures = unpark_failures
     if post:
-        applied, write_failures = apply_plan(g, plan.writes)
-        failures += write_failures
+        applied, write_stats = apply_plan(g, plan.writes)
+        stats.update(write_stats)
         done = Counter(w.kind for w in applied)
-        log("written", opened=done["open"], closed=done["close"], updated=done["update"], failed=write_failures)
+        log("written", opened=done["open"], closed=done["close"], updated=done["update"], **{k: v for k, v in sorted(write_stats.items())})
+        set_deadline(None)
+        loops_now, fresh_unreadable = fresh_loops(g, project(lr["loops"], applied), stats)
+        if fresh_unreadable is not None:
+            unreadable = fresh_unreadable
     else:
         applied = plan.writes
         print(f"would open {by_kind['open']}, close {by_kind['close']}, update {by_kind['update']}")
         for w in plan.writes:
             print(f"  {w.kind} loop:{w.key}" + (f" supersedes {w.supersedes}" if w.supersedes else "") + f" :: {w.claim}")
-    text = build_post(now, project(lr["loops"], applied), closes=[w for w in applied if w.kind == "close"], counts=plan.counts,
-                      not_evaluated=not_evaluated, unreadable=unreadable, write_failures=failures, portal_ids=portal_ids, links=links)
+        loops_now = project(lr["loops"], applied)
+    text = build_post(now, loops_now, closes=[w for w in applied if w.kind == "close"], counts=plan.counts,
+                      not_evaluated=not_evaluated, unreadable=unreadable, stats=stats, portal_ids=portal_ids, links=links)
     if post:
         log("posted", messages=send(env["OPEN_LOOPS_WEBHOOK"], text))
     else:
         print("--- DRY RUN: nothing written, nothing posted ---\n" + text)
-    return 1 if failures else 0
+    failing = sum(stats[k] for k in ("failed", "unknown", "not_made", "reread_failed"))
+    return 1 if failing else 0  # a conflict alone is not a failure (row 7)
 
 
 def clock_skew() -> tuple:
@@ -1169,8 +1530,14 @@ def clock_skew() -> tuple:
 
 def run_check(env: dict) -> int:
     ok = True
-    print("settings: " + " | ".join(f"{k} {'set' if env.get(k) else 'MISSING'}" for k in CHECKED))
-    if any(not env.get(k) for k in CHECKED):
+    try:
+        provider = provider_of(env)
+    except ConfigError as e:
+        print(f"settings: {one_line(e)}")
+        provider, ok = DEFAULT_PROVIDER, False
+    checked = list(PROVIDER_SETTINGS.get(provider, ())) + ["OPEN_LOOPS_WEBHOOK"] + list(BASE_SETTINGS)
+    print(f"settings (provider {provider}): " + " | ".join(f"{k} {'set' if env.get(k) else 'MISSING'}" for k in checked))
+    if any(not env.get(k) for k in checked):
         ok = False
     members = parse_members(env.get("XACTCO_MEMBERS"))
     print(f"members: {len(members.ids)} user ids, {len(members.names)} names")
@@ -1181,6 +1548,8 @@ def run_check(env: dict) -> int:
             print(f"grysstof: {len(s['msgs'])} messages in the window, loops {dict(sorted(states.items()))}, "
                   f"{len(due_parked(s['loops']['loops'], now_sast()))} parked due back, "
                   f"{len(s['loops'].get('unreadable') or [])} unreadable, portal lists {len(s['portal'])} loose ends")
+        except Terminated:
+            raise
         except JobError as e:
             print(f"grysstof: FAILED {one_line(e)[:300]}")
             ok = False
@@ -1189,6 +1558,8 @@ def run_check(env: dict) -> int:
         good = abs(skew) <= MAX_SKEW_SECONDS
         print(f"clock: {'ok' if good else 'FAILED'}, Pi is {skew:+.0f} s against Discord ({theirs:%H:%M:%S} UTC); limit {MAX_SKEW_SECONDS} s")
         ok = ok and good
+    except Terminated:
+        raise
     except JobError as e:
         print(f"clock: FAILED {one_line(e)[:300]}")
         ok = False
@@ -1236,6 +1607,10 @@ def readable_console() -> None:
             pass  # not a text stream that can be reconfigured (a test's StringIO); nothing to protect
 
 
+def _on_sigterm(signum, frame):
+    raise Terminated("terminated by SIGTERM (the cron line's `timeout 900`?)")
+
+
 def main(argv=None) -> int:
     readable_console()
     p = argparse.ArgumentParser(description="Open loops: the morning list, kept as a ledger record.")
@@ -1265,9 +1640,16 @@ def main(argv=None) -> int:
             else:
                 print(f"FAILED: another run holds the lock {args.lock}; exiting", file=sys.stderr)
             return 3
+    installed, previous = False, None
+    try:
+        previous = signal.signal(signal.SIGTERM, _on_sigterm)
+        installed = True
+    except (ValueError, OSError, AttributeError):
+        pass  # not the main thread, or no SIGTERM here: cron's timeout then ends the run without a post
     try:
         return run_check(env) if args.check else run(env, args.post)
     except Exception as e:  # never fail silently: one line here, and in the channel when posting
+        set_deadline(None)
         print(f"FAILED: {type(e).__name__}: {one_line(e)[:400]}", file=sys.stderr)
         if args.post and not args.check and env.get("OPEN_LOOPS_WEBHOOK"):
             try:
@@ -1276,6 +1658,8 @@ def main(argv=None) -> int:
                 print(f"FAILED: and the post saying so failed: {one_line(e2)[:200]}", file=sys.stderr)
         return 2 if isinstance(e, ConfigError) else 1
     finally:
+        if installed:
+            signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
         if lock:
             release_lock(lock)
 
