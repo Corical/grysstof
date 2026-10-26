@@ -11,31 +11,29 @@
  * (an ISO date; every readable text channel with no watermark yet is seeded to it,
  * so the next start imports history from that date; remove it once done),
  * DISCORD_CAPTURE_GUILDS (comma-separated guild ids; unset means every guild, as before;
- * when set, messages, backfill and reactions of other guilds are skipped, each guild logged once).
+ * when set, messages, backfill and reactions of other guilds are skipped, each guild logged once,
+ * backfill waits up to 30 s for the guild list, and the loops assistant answers only there).
  *
  * The loops assistant (writer/discord-pa.ts): PA_ENABLED (unset means off), PA_USERS
  * (comma-separated Discord user ids allowed to use /loops). When on, /loops and /loops-help are
- * registered in each allowed guild at READY; interactions are handled beside the capture queue,
- * never in it, and can never end the process.
+ * registered in each allowed guild at READY, retried with backoff until they take; interactions
+ * are handled beside the capture queue, never in it, and can never end the process.
  *
  * Idempotent across restarts: the last captured message id per channel is
  * written after every successful post; on start, every known channel is
  * backfilled from its watermark, so downtime loses nothing and nothing is
  * posted twice. A channel seen for the first time starts from now.
+ *
+ * This file is the socket, the environment and the real I/O. What the bot does with each gateway
+ * event is writer/discord-dispatch.ts, tested with a fake gateway.
  */
-import { advance, type Capture, type DiscordMessage, distil, type Names, type Reaction, type Watermarks } from "../writer/discord.ts";
-import { type ReactionIo, syncChannelReactions, syncMessageReactions } from "../writer/discord-reactions.ts";
-import { guildAllowed, type Interaction, makeGuildFilter, onInteraction, type PaIo, paConfig, parseIdList, registerCommands } from "../writer/discord-pa.ts";
+import type { Capture, Reaction, Watermarks } from "../writer/discord.ts";
+import { createBot } from "../writer/discord-dispatch.ts";
+import { type PaIo, paConfig, parseIdList } from "../writer/discord-pa.ts";
 import { browseHistory, browseLoops, discordClient, type HttpDeps, mcpCapture, mcpTool } from "../writer/discord-rest.ts";
 
 const API = "https://discord.com/api/v10";
 const INTENTS = (1 << 0) | (1 << 9) | (1 << 10) | (1 << 15); // GUILDS, GUILD_MESSAGES, GUILD_MESSAGE_REACTIONS, MESSAGE_CONTENT
-/** After a reconnect, reactions on messages this recent are re-read: a 👍 given while the bot was down still lands. */
-const REACTION_CATCHUP_DAYS = 7;
-/** A burst of reactions on one message becomes one refresh this long after the last. */
-const REACTION_SETTLE_MS = 3000;
-const THREAD_TYPES = new Set([10, 11, 12]);
-const BACKFILL_PAGE = 100;
 
 const token = Deno.env.get("DISCORD_BOT_TOKEN");
 const key = Deno.env.get("MCP_ACCESS_KEY");
@@ -56,37 +54,6 @@ async function log(fields: Record<string, unknown>) {
   } catch { /* the log is a courtesy */ }
 }
 
-// --- which guilds are captured, and the loops assistant ---
-const captureGuilds = parseIdList(Deno.env.get("DISCORD_CAPTURE_GUILDS"));
-const captureGuild = makeGuildFilter(captureGuilds, (guild) => void log({ event: "capture.guild_skipped", guild, hint: "not in DISCORD_CAPTURE_GUILDS" }));
-const pa = paConfig(Deno.env.get("PA_ENABLED"), Deno.env.get("PA_USERS"), captureGuilds);
-const paRest: HttpDeps = { onRateLimit: (f) => void log({ event: "discord.rate_limited", ...f }) };
-const tool = mcpTool(brainUrl, key!, paRest);
-const paIo: PaIo = {
-  discord: discordClient(token!, paRest),
-  loops: browseLoops(brainUrl, key!, paRest),
-  capture: mcpCapture(brainUrl, key!, paRest),
-  history: browseHistory(brainUrl, key!, paRest),
-  supersede: (actor, newerId, olderId) => tool(actor, "supersede_fact", { newer_id: newerId, older_id: olderId }),
-  log,
-  now: () => new Date(),
-};
-let commandsRegistered = false;
-
-// --- names: guild and channel ids to what a person calls them ---
-const guilds = new Map<string, string>();
-type Chan = { name: string; type: number; parent?: string; guild?: string };
-const channels = new Map<string, Chan>();
-
-/** REST message objects carry no guild_id; the channel cache does, so every proof link can name the guild. */
-function remember(c: { id: string; name?: string; type: number; parent_id?: string | null; guild_id?: string }, guild?: string) {
-  channels.set(c.id, { name: c.name ?? c.id, type: c.type, parent: c.parent_id ?? undefined, guild: guild ?? c.guild_id ?? channels.get(c.id)?.guild });
-}
-
-function withGuild(m: DiscordMessage): DiscordMessage {
-  return m.guild_id ? m : { ...m, guild_id: channels.get(m.channel_id)?.guild };
-}
-
 async function rest<T>(path: string): Promise<T> {
   for (;;) {
     const res = await fetch(`${API}${path}`, { headers: { authorization: `Bot ${token}` } });
@@ -102,49 +69,17 @@ async function rest<T>(path: string): Promise<T> {
   }
 }
 
-/** A Discord snowflake for an instant: everything after it was posted after that instant. */
-function snowflakeAt(iso: string): string {
-  return ((BigInt(Date.parse(iso)) - 1420070400000n) << 22n).toString();
-}
-
-async function namesFor(m: DiscordMessage): Promise<Names> {
-  let c = channels.get(m.channel_id);
-  if (!c) {
-    try {
-      remember(await rest<{ id: string; name?: string; type: number; parent_id?: string | null; guild_id?: string }>(`/channels/${m.channel_id}`));
-    } catch (e) {
-      await log({ event: "channel.lookup_failed", channel: m.channel_id, error: String(e) });
-    }
-    c = channels.get(m.channel_id) ?? { name: m.channel_id, type: 0 };
-  }
-  const parent = THREAD_TYPES.has(c.type) && c.parent ? channels.get(c.parent)?.name : undefined;
-  const parentId = THREAD_TYPES.has(c.type) ? c.parent : undefined; // a plain channel's parent is its category, not a conversation
-  return { guild: m.guild_id ? guilds.get(m.guild_id) : undefined, channel: c.name, parent, parentId, channelNames: (id) => channels.get(id)?.name };
-}
-
-/** The guild a channel belongs to: the cache, else (only when the allowlist needs to know) one REST lookup. */
-async function guildOf(channelId: string): Promise<string | undefined> {
-  if (captureGuilds && !channels.get(channelId)?.guild) {
-    try {
-      remember(await rest<{ id: string; name?: string; type: number; parent_id?: string | null; guild_id?: string }>(`/channels/${channelId}`));
-    } catch (e) {
-      await log({ event: "channel.lookup_failed", channel: channelId, error: String(e) });
-    }
-  }
-  return channels.get(channelId)?.guild;
-}
-
 // --- watermarks ---
-let marks: Watermarks = {};
+let initialMarks: Watermarks = {};
 try {
-  marks = JSON.parse(await Deno.readTextFile(watermarkPath)) as Watermarks;
+  initialMarks = JSON.parse(await Deno.readTextFile(watermarkPath)) as Watermarks;
 } catch { /* first run */ }
-async function saveMarks() {
+async function saveMarks(marks: Watermarks) {
   await Deno.mkdir(logDir, { recursive: true });
   await Deno.writeTextFile(watermarkPath, JSON.stringify(marks, null, 2));
 }
 
-// --- posting to the brain, one at a time, in arrival order ---
+// --- posting to the brain ---
 function textOf(raw: string): string {
   const data = raw.includes("\ndata:") || raw.startsWith("event:") ? (raw.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).pop() ?? "{}") : raw;
   const msg = JSON.parse(data);
@@ -201,104 +136,25 @@ async function postReactions(source: string, reactions: Reaction[]): Promise<str
   }
 }
 
-const reactionIo: ReactionIo = { rest, post: postReactions };
-const settling = new Map<string, ReturnType<typeof setTimeout>>();
-
-/** Refresh one message's reactions once they settle, in line behind any capture still queued for it. */
-function reactionChanged(d: { guild_id?: string; channel_id: string; message_id: string }) {
-  const k = `${d.channel_id}/${d.message_id}`;
-  clearTimeout(settling.get(k));
-  settling.set(k, setTimeout(() => {
-    settling.delete(k);
-    chain = chain.then(async () => {
-      try {
-        const outcome = await syncMessageReactions(reactionIo, d.guild_id ?? "@me", d.channel_id, d.message_id);
-        await log({ event: "reactions.synced", channel: d.channel_id, message: d.message_id, outcome });
-      } catch (e) {
-        await log({ event: "reactions.failed", channel: d.channel_id, message: d.message_id, error: String(e) });
-      }
-    });
-  }, REACTION_SETTLE_MS));
-}
-
-/** After a reconnect: re-read the last few days' reactions in every tracked channel. */
-async function reactionCatchUp() {
-  const since = snowflakeAt(new Date(Date.now() - REACTION_CATCHUP_DAYS * 86_400_000).toISOString());
-  for (const channelId of Object.keys(marks)) {
-    const owner = await guildOf(channelId);
-    if (!captureGuild(owner)) continue;
-    const guild = owner ?? "@me";
-    try {
-      const done = await syncChannelReactions(reactionIo, guild, channelId, since);
-      if (done.withReactions) await log({ event: "reactions.caught_up", channel: channelId, ...done });
-    } catch (e) {
-      await log({ event: "reactions.catchup_failed", channel: channelId, error: String(e) });
-    }
-  }
-}
-
-let chain = Promise.resolve();
-function enqueue(raw: DiscordMessage, via: "gateway" | "backfill") {
-  chain = chain.then(async () => {
-    const names = await namesFor(raw);
-    const m = withGuild(raw);
-    if (!captureGuild(m.guild_id)) return;
-    const d = distil(m, names);
-    if ("skip" in d) {
-      await log({ event: "message.skipped", via, id: m.id, channel: m.channel_id, reason: d.skip });
-      return;
-    }
-    try {
-      const answer = await post(d);
-      marks = advance(marks, m.channel_id, m.id);
-      await saveMarks();
-      await log({ event: "message.captured", via, id: m.id, channel: m.channel_id, actor: d.actor, answer });
-    } catch (e) {
-      await log({ event: "message.failed", via, id: m.id, channel: m.channel_id, error: String(e) });
-    }
-  });
-  return chain;
-}
-
-// --- backfill: what was said while the bot was down ---
-async function backfill() {
-  const since = Deno.env.get("DISCORD_BACKFILL_SINCE");
-  if (since) {
-    const seed = snowflakeAt(since);
-    let seeded = 0;
-    for (const g of await rest<{ id: string }[]>("/users/@me/guilds")) {
-      if (!captureGuild(g.id)) continue;
-      const chans = await rest<{ id: string; name?: string; type: number; parent_id?: string | null }[]>(`/guilds/${g.id}/channels`);
-      for (const c of chans) {
-        remember(c, g.id);
-        if (c.type !== 0 || marks[c.id]) continue;
-        marks[c.id] = seed;
-        seeded++;
-      }
-    }
-    await saveMarks();
-    await log({ event: "backfill.seeded", since, channels: seeded });
-  }
-  for (const [channelId, after] of Object.entries(marks)) {
-    if (!captureGuild(await guildOf(channelId))) continue;
-    let cursor = after;
-    for (;;) {
-      let page: DiscordMessage[];
-      try {
-        page = await rest<DiscordMessage[]>(`/channels/${channelId}/messages?after=${cursor}&limit=${BACKFILL_PAGE}`);
-      } catch (e) {
-        await log({ event: "backfill.failed", channel: channelId, error: String(e) });
-        break;
-      }
-      if (page.length === 0) break;
-      page.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
-      for (const m of page) enqueue(m, "backfill");
-      cursor = page[page.length - 1].id;
-      if (page.length < BACKFILL_PAGE) break;
-    }
-  }
-  await chain;
-}
+// --- the bot: the loops assistant's I/O, then everything that decides something ---
+const captureGuilds = parseIdList(Deno.env.get("DISCORD_CAPTURE_GUILDS"));
+const pa = paConfig(Deno.env.get("PA_ENABLED"), Deno.env.get("PA_USERS"), captureGuilds);
+const paRest: HttpDeps = { onRateLimit: (f) => void log({ event: "discord.rate_limited", ...f }) };
+const tool = mcpTool(brainUrl, key!, paRest);
+const paIo: PaIo = {
+  discord: discordClient(token!, paRest),
+  loops: browseLoops(brainUrl, key!, paRest),
+  capture: mcpCapture(brainUrl, key!, paRest),
+  history: browseHistory(brainUrl, key!, paRest),
+  supersede: (actor, newerId, olderId) => tool(actor, "supersede_fact", { newer_id: newerId, older_id: olderId }),
+  log,
+  now: () => new Date(),
+};
+const bot = createBot(
+  { rest, post, postReactions, saveMarks, log, timers: { set: (fn, ms) => setTimeout(fn, ms), clear: (h) => clearTimeout(h as number) }, now: () => Date.now() },
+  { captureGuilds, backfillSince: Deno.env.get("DISCORD_BACKFILL_SINCE"), pa, paIo },
+  initialMarks,
+);
 
 // --- gateway ---
 type Payload = { op: number; d?: unknown; s?: number | null; t?: string | null };
@@ -345,7 +201,22 @@ function connect(url: string, resume: boolean) {
         break;
       }
       case 0:
-        await dispatch(p.t!, p.d);
+        if (p.t === "READY") {
+          const r = p.d as { session_id: string; resume_gateway_url: string; user: { username: string } };
+          sessionId = r.session_id;
+          resumeUrl = r.resume_gateway_url;
+          await log({
+            event: "gateway.ready",
+            bot: r.user.username,
+            brain: brainUrl,
+            watermarks: Object.keys(bot.marks()).length,
+            captureGuilds: captureGuilds ? [...captureGuilds] : "all",
+            pa: pa.enabled ? `on, ${pa.users.size} user(s)` : "off",
+          });
+        } else if (p.t === "RESUMED") {
+          await log({ event: "gateway.resumed" });
+        }
+        await bot.dispatch(p.t!, p.d);
         break;
     }
   };
@@ -360,66 +231,6 @@ function connect(url: string, resume: boolean) {
     setTimeout(() => connect(sessionId && resumeUrl ? resumeUrl : url, Boolean(sessionId)), 2000 + Math.random() * 3000);
   };
   ws.onerror = (e) => log({ event: "gateway.error", error: String((e as ErrorEvent).message ?? e) });
-}
-
-async function dispatch(t: string, d: unknown) {
-  switch (t) {
-    case "READY": {
-      const r = d as { session_id: string; resume_gateway_url: string; user: { username: string }; application?: { id?: string }; guilds?: { id: string }[] };
-      sessionId = r.session_id;
-      resumeUrl = r.resume_gateway_url;
-      await log({
-        event: "gateway.ready",
-        bot: r.user.username,
-        brain: brainUrl,
-        watermarks: Object.keys(marks).length,
-        captureGuilds: captureGuilds ? [...captureGuilds] : "all",
-        pa: pa.enabled ? `on, ${pa.users.size} user(s)` : "off",
-      });
-      backfill().then(reactionCatchUp);
-      if (pa.enabled && !commandsRegistered) {
-        // Beside the backfill, never awaited, never rejecting; a failure is retried at the next READY.
-        commandsRegistered = true;
-        const ids = (r.guilds ?? []).map((g) => g.id).filter((id) => guildAllowed(captureGuilds, id));
-        registerCommands(paIo, r.application?.id ?? "", ids).then((ok) => {
-          if (!ok) commandsRegistered = false;
-        });
-      }
-      break;
-    }
-    case "RESUMED":
-      await log({ event: "gateway.resumed" });
-      break;
-    case "GUILD_CREATE": {
-      const g = d as { id: string; name: string; channels: { id: string; name?: string; type: number; parent_id?: string | null }[]; threads?: { id: string; name?: string; type: number; parent_id?: string | null }[] };
-      guilds.set(g.id, g.name);
-      for (const c of [...g.channels, ...(g.threads ?? [])]) remember(c, g.id);
-      await log({ event: "guild.seen", guild: g.name, channels: g.channels.length, threads: g.threads?.length ?? 0 });
-      break;
-    }
-    case "CHANNEL_CREATE":
-    case "CHANNEL_UPDATE":
-    case "THREAD_CREATE":
-    case "THREAD_UPDATE":
-      remember(d as { id: string; name?: string; type: number; parent_id?: string | null; guild_id?: string });
-      break;
-    case "MESSAGE_CREATE":
-      enqueue(d as DiscordMessage, "gateway");
-      break;
-    case "MESSAGE_REACTION_ADD":
-    case "MESSAGE_REACTION_REMOVE":
-    case "MESSAGE_REACTION_REMOVE_ALL":
-    case "MESSAGE_REACTION_REMOVE_EMOJI": {
-      const r = d as { guild_id?: string; channel_id: string; message_id: string };
-      if (captureGuild(r.guild_id)) reactionChanged(r);
-      break;
-    }
-    case "INTERACTION_CREATE":
-      // Not awaited and never rejecting: a command must not wait behind a capture, and nothing the
-      // PA does can throw out of this handler and end the process.
-      onInteraction(pa, paIo, d as Interaction).catch(() => {});
-      break;
-  }
 }
 
 const { url } = await rest<{ url: string }>("/gateway/bot");
