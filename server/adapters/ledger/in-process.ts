@@ -105,29 +105,44 @@ export class InProcessLedger implements Ledger {
     }
   }
 
+  /**
+   * Check-then-write, one writer at a time. A persisting subclass applies its event only after an
+   * await, so without this two writers superseding the same line could both pass the check and
+   * leave two current lines (a fork). Embedding stays outside: it is slow and changes no state.
+   */
+  private writing: Promise<unknown> = Promise.resolve();
+  private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.writing.then(fn);
+    this.writing = run.catch(() => {});
+    return run;
+  }
+
   async assert(scope: Scope, a: Assertion): Promise<Fact> {
     const subject = must(clean(a.subject), "subject");
     const claim = must(clean(a.claim), "claim");
     const source = must(clean(a.source), "source");
     const proof = clean(a.proof) || undefined;
     const tags = [...new Set((a.tags ?? []).map(clean).filter(Boolean))];
-    const older = a.supersedes ? this.linkable(scope, a.supersedes, subject) : null;
     const occurredAt = occurredAtOf(a.occurredAt);
-    const fact: Fact = {
-      id: `fact_${(++this.seq).toString(36).padStart(6, "0")}_${crypto.randomUUID().slice(0, 8)}`,
-      tenant: scope.tenant,
-      subject,
-      claim,
-      source,
-      ...(proof ? { proof } : {}),
-      tags,
-      learnedBy: scope.actor,
-      learnedAt: this.now().toISOString(),
-      ...(occurredAt ? { occurredAt } : {}),
-      confirmed: false,
-      ...(older ? { supersedes: older.id } : {}),
-    };
-    await this.record({ kind: "assert", fact });
+    const fact = await this.exclusive(async () => {
+      const older = a.supersedes ? this.linkable(scope, a.supersedes, subject) : null;
+      const fact: Fact = {
+        id: `fact_${(++this.seq).toString(36).padStart(6, "0")}_${crypto.randomUUID().slice(0, 8)}`,
+        tenant: scope.tenant,
+        subject,
+        claim,
+        source,
+        ...(proof ? { proof } : {}),
+        tags,
+        learnedBy: scope.actor,
+        learnedAt: this.now().toISOString(),
+        ...(occurredAt ? { occurredAt } : {}),
+        confirmed: false,
+        ...(older ? { supersedes: older.id } : {}),
+      };
+      await this.record({ kind: "assert", fact });
+      return fact;
+    });
     await this.embedFact(fact);
     return this.copy(scope, fact.id)!;
   }
@@ -153,17 +168,19 @@ export class InProcessLedger implements Ledger {
 
   async supersede(scope: Scope, newerId: string, olderId: string): Promise<Fact> {
     if (newerId === olderId) throw new Error("A fact cannot supersede itself");
-    const newer = this.owned(scope, newerId);
-    const older = this.linkable(scope, olderId, newer.subject);
-    const seen = new Set<string>([newer.id]);
-    for (let cur: Fact | undefined = newer; cur?.supersededBy;) {
-      if (cur.supersededBy === older.id) throw new Error(`Superseding ${older.id} with ${newer.id} would form a cycle`);
-      if (seen.has(cur.supersededBy)) break;
-      seen.add(cur.supersededBy);
-      cur = this.lines(scope.tenant).get(cur.supersededBy);
-    }
-    await this.record({ kind: "supersede", tenant: scope.tenant, newer: newer.id, older: older.id });
-    return this.copy(scope, newer.id)!;
+    return await this.exclusive(async () => {
+      const newer = this.owned(scope, newerId);
+      const older = this.linkable(scope, olderId, newer.subject);
+      const seen = new Set<string>([newer.id]);
+      for (let cur: Fact | undefined = newer; cur?.supersededBy;) {
+        if (cur.supersededBy === older.id) throw new Error(`Superseding ${older.id} with ${newer.id} would form a cycle`);
+        if (seen.has(cur.supersededBy)) break;
+        seen.add(cur.supersededBy);
+        cur = this.lines(scope.tenant).get(cur.supersededBy);
+      }
+      await this.record({ kind: "supersede", tenant: scope.tenant, newer: newer.id, older: older.id });
+      return this.copy(scope, newer.id)!;
+    });
   }
 
   async find(scope: Scope, query: string, opts: FindOptions): Promise<Found[]> {
