@@ -20,6 +20,7 @@ __pycache__/
 server/.env
 server/.env.*
 server/seed-failures*.jsonl
+server/jobs/.env*
 credentials.json
 token.json
 gmail-sync-log.json
