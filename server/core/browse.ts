@@ -5,6 +5,7 @@
 import type { Ports, RecentQuery, Scope } from "./ports/mod.ts";
 import { wholeDayUntil } from "./when.ts";
 import { clientCards, clientForChannel, type Conversation, conversations, exploreGraph, looseEnds, toMessages } from "./pulse.ts";
+import { LOOP_PREFIX, loopQuery, type LoopView, readLoop, selectLoops } from "./loops.ts";
 
 const PREFIX = "/browse/api";
 
@@ -110,6 +111,13 @@ const ROUTES = new Map<string, Route>(Object.entries({
     for (const n of graph.nodes) if (n.kind === "message") n.hit = n.id === opened.id;
     return { ...summariseConversation(conv, clientForChannel(conv.channel, p.clients, p.overrides).client), messages: conv.messages, graph };
   },
+  // Plan 5, C3: every loop the bot believes in, by state; consumed by the open-loops job and the PA in Discord.
+  "/loops": async (q, ports, scope) => {
+    const query = loopQuery({ state: param(q, "state"), since: param(q, "since"), client: param(q, "client"), limit: limitOf(q, 200, 2000) });
+    const read = await readLoops(ports, scope);
+    const { loops, total } = selectLoops(read.loops, query, new Date());
+    return { loops, unreadable: read.unreadable, warnings: { understandFailed: read.understandFailed }, total };
+  },
   "/recall": async (q, { memory }, scope) => ({
     thoughts: await memory.recall(scope, q.get("q") ?? "", { limit: limitOf(q, 50, 500), minScore: 0 }),
   }),
@@ -133,6 +141,32 @@ async function pulseInputs(ports: Ports, scope: Scope) {
     if (f) overrides[s.subject.slice("channel:".length).replace(/^#/, "").toLowerCase()] = f.claim.trim();
   }
   return { messages: toMessages(thoughts), clients, factCounts, overrides };
+}
+
+/**
+ * Every loop subject of the tenant read into a loop, in subject order. A loop that cannot be read
+ * is listed under `unreadable` and logged, never dropped; a fork is logged. `understandFailed`
+ * counts current lines written without tags, i.e. while Understanding was down.
+ */
+async function readLoops(ports: Ports, scope: Scope) {
+  const subjects = (await ports.ledger.subjects(scope)).map((s) => s.subject).filter((s) => s.startsWith(LOOP_PREFIX)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const loops: LoopView[] = [];
+  const unreadable: { subject: string; lineId: string }[] = [];
+  let understandFailed = 0;
+  for (const subject of subjects) {
+    const history = await ports.ledger.history(scope, subject);
+    const heads = history.filter((f) => !f.supersededBy);
+    understandFailed += heads.filter((f) => f.tags.length === 0).length;
+    const r = readLoop(subject, history);
+    if (r.ok) {
+      loops.push(r.loop);
+      if (r.loop.fork) ports.log.warn("loops.fork", { subject, lineId: r.loop.lineId, heads: heads.map((f) => f.id), tenant: scope.tenant, actor: scope.actor });
+    } else {
+      unreadable.push({ subject, lineId: r.unreadable.lineId });
+      ports.log.warn("loops.unreadable", { subject, lineId: r.unreadable.lineId, reason: r.unreadable.reason, tenant: scope.tenant, actor: scope.actor });
+    }
+  }
+  return { loops, unreadable, understandFailed };
 }
 
 function summariseConversation(c: Conversation, client: string | null) {
