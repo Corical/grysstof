@@ -16,9 +16,9 @@ import {
   parseIdList,
   registerCommands,
   resolvedLine,
-  sanitise,
 } from "../writer/discord-pa.ts";
 import { browseLoops, discordClient, HttpError, mcpCapture, mcpText, send, TimeoutError } from "../writer/discord-rest.ts";
+import { type LoopLine, type OpenLine, parse, sanitise } from "../core/loops.ts";
 
 // ---------- fixtures ----------
 
@@ -100,15 +100,22 @@ function reply(all: Loop[], q: Record<string, string>) {
   return { loops: hit, unreadable: [], warnings: { understandFailed: 0 }, total: hit.length };
 }
 
-/** A fake ledger behind /mcp: refuses a `supersedes` that is not the loop's current line, exactly as the real one does. */
+/**
+ * A fake ledger behind /mcp: refuses a `supersedes` that is not the loop's current line, exactly as
+ * the real one does, and takes the new state from lane A's own parser, so a line the PA writes that
+ * the route could not read fails the test that wrote it.
+ */
 function ledger(data: Loop[]) {
   let n = 0;
   return (args: Record<string, unknown>) => {
+    const read = parse(String(args.content));
+    if (!read.ok) return { text: `Failed to capture: test ledger cannot read the line (${read.reason})`, isError: true };
     const key = String(args.subject).slice("loop:".length);
+    if (read.line.key !== key) return { text: `Failed to capture: line is for key ${read.line.key}, subject is ${args.subject}`, isError: true };
     const i = data.findIndex((l) => l.key === key);
     if (i < 0) return { text: `Failed to capture: No fact ${args.supersedes}`, isError: true };
     if (data[i].lineId !== args.supersedes) return { text: `Failed to capture: Fact ${args.supersedes} is already superseded by ${data[i].lineId}`, isError: true };
-    const state = ({ OPEN: "open", RESOLVED: "resolved", PARKED: "parked" } as const)[String(args.content).split("/")[0] as "OPEN"];
+    const state = read.line.tag.toLowerCase() as Loop["state"];
     const id = `fact_9${String(++n).padStart(5, "0")}_cccccccc`;
     data[i] = { ...data[i], state, lineId: id };
     return { text: `Recorded fact ${id} about ${args.subject} (from ${args.source}, by discord:kellireynolds, unconfirmed)`, isError: false };
@@ -794,13 +801,13 @@ Deno.test("registration through the real REST helper: a 429 is waited out as Dis
 
 Deno.test("composer: one physical line, ' | ' only between fields, fields in contract order, hostile text sanitised, title 120 / summary 300 / note 300 at most, evidence 8 newest", () => {
   const hostile = "a | b\nc\r\td\u0000e\u001b[31m \u2028 f||g";
-  assertEquals(sanitise(hostile), "a b c de[31m f g", "pipes and line breaks become spaces, other control characters are removed, whitespace collapses");
+  assertEquals(sanitise(hostile, 300), "a b c d e [31m fg", "core/loops.ts: pipes removed, line breaks and control characters become spaces, whitespace collapses");
   const r = resolvedLine("1430000000000000001", KELLI.id, "kelli|reynolds\n", NOW, hostile + "x".repeat(400));
   assert(!/[\r\n]/.test(r));
   const parts = r.split(" | ");
   assertEquals(parts.map((p) => p.split("=")[0]), ["RESOLVED/1", "key", "by_user", "by_name", "resolved", "note"]);
-  assertEquals(parts[3], "by_name=kelli reynolds");
-  assert(parts[5].length - "note=".length <= 300);
+  assertEquals(parts[3], "by_name=kellireynolds");
+  assert([...parts[5]].length - "note=".length <= 300);
 
   assertEquals(parkedLine("1430000000000000001", KELLI.id, "kellireynolds", "2026-11-02", "n"), `PARKED/1 | key=1430000000000000001 | by_user=${KELLI.id} | by_name=kellireynolds | until=2026-11-02 | note=n`);
 
@@ -808,17 +815,38 @@ Deno.test("composer: one physical line, ' | ' only between fields, fields in con
   const o = openLine(loop(1, { title: "😀".repeat(100) + "|", summary: "s".repeat(500), owner: "Kel|li", evidence: ev }), null);
   const fields = Object.fromEntries(o.split(" | ").slice(1).map((p) => [p.slice(0, p.indexOf("=")), p.slice(p.indexOf("=") + 1)]));
   assertEquals(o.split(" | ").map((p) => p.split("=")[0]), ["OPEN/1", "key", "client", "type", "owner", "channel", "channel_id", "opened", "reopened", "title", "summary", "evidence"]);
-  assert(fields.title.length <= 120 && !/[\ud800-\udbff](?![\udc00-\udfff])/.test(fields.title), "title cut at 120 without splitting an emoji");
-  assert(fields.summary.length <= 300);
-  assertEquals(fields.owner, "Kel li");
+  assert([...fields.title].length <= 120 && !/[\ud800-\udbff](?![\udc00-\udfff])/.test(fields.title), "title at most 120 characters without splitting an emoji");
+  assert([...fields.summary].length <= 300);
+  assertEquals(fields.owner, "Kelli");
   assertEquals(fields.reopened, "-");
-  const newest = new Set(ev.map(BigInt).sort((a, b) => (a < b ? -1 : 1)).slice(-8).map(String));
-  assertEquals(fields.evidence.split(","), ev.filter((id) => newest.has(id)), "the eight newest message ids, in the order they were given");
+  assertEquals(fields.evidence.split(","), ev.slice(-8), "the last eight given, in order: core/loops.ts reads list position as age");
   assertEquals(openLine(loop(3, { evidence: ["1431000000000000009", "1431000000000000001"] }), null).split("evidence=")[1], "1431000000000000009,1431000000000000001", "eight or fewer: untouched, so a rewrite never looks like a change");
   const blanks = openLine(loop(2, { client: null, owner: null, reopened: null }), "2026-10-26T20:00:00.000Z");
   assertStringIncludes(blanks, "| client=internal |");
   assertStringIncludes(blanks, "| owner=unclear |");
   assertStringIncludes(blanks, "| reopened=2026-10-26T20:00:00.000Z |");
+});
+
+Deno.test("every line the PA writes reads back through core/loops.ts's parser with its state, key, user id and note intact, even from a hostile title", async () => {
+  const data = [loop(1), loop(2), loop(3, { state: "closed", closed: "2026-10-25T10:00:00.000Z", title: "Q3 | report\nhold <@1> **now**" })];
+  const h = harness({ data });
+  await onInteraction(cfg, h.io, command("loops"));
+  const open = h.lastEdit();
+  await onInteraction(cfg, h.io, pressOn(open, "Resolve 1"));
+  await onInteraction(cfg, h.io, pressOn(open, "Park 2"));
+  await onInteraction(cfg, h.io, command("loops", [{ name: "state", type: 3, value: "closed" }]));
+  await onInteraction(cfg, h.io, pressOn(h.lastEdit(), "Reopen 2")); // item 1 is loop 1, resolved a moment ago
+  const caps = h.captures();
+  assertEquals(caps.length, 3);
+  const read = caps.map((c) => parse(String(c.args.content)));
+  assert(read.every((p) => p.ok), JSON.stringify(read));
+  const [resolved, parked, reopened] = read.map((p) => (p as { ok: true; line: LoopLine }).line);
+  assertEquals(resolved, { tag: "RESOLVED", key: keyOf(1), byUser: KELLI.id, byName: "kellireynolds", resolved: NOW.toISOString(), note: "pressed Resolve in /loops" });
+  assertEquals(parked, { tag: "PARKED", key: keyOf(2), byUser: KELLI.id, byName: "kellireynolds", until: "2026-11-02", note: "pressed Park in /loops" });
+  const o = reopened as OpenLine;
+  assertEquals([o.tag, o.key, o.reopened, o.opened, o.title, o.channelId, o.evidence], ["OPEN", keyOf(3), NOW.toISOString(), "2026-10-01T11:00:00.000Z", "Q3 report hold <@1> **now**", CHANNEL, [keyOf(3)]]);
+  assertEquals(caps.map((c) => c.args.subject), [1, 2, 3].map((i) => `loop:${keyOf(i)}`), "each line is written under its own loop's subject");
+  assertEquals(h.data.map((l) => l.state), ["resolved", "parked", "open"]);
 });
 
 Deno.test("a loop record missing what an OPEN line needs is not reopened half-written", async () => {

@@ -13,6 +13,7 @@
  *  - `onInteraction` and `registerCommands` never reject: the capture bot must not die of the PA.
  *  - Every failure is one log line with an event name; nothing pings anyone (`parse: []`).
  */
+import { compose, LIMITS, LOOP_STATES, type LoopState, type LoopType, type LoopView, sanitise } from "../core/loops.ts";
 import { HttpError, type McpAnswer, TimeoutError } from "./discord-rest.ts";
 
 export const PAGE_SIZE = 6;
@@ -65,34 +66,14 @@ export function makeGuildFilter(allow: ReadonlySet<string> | undefined, onSkip: 
 
 // ---------- shapes ----------
 
-export type LoopState = "open" | "parked" | "closed" | "resolved";
+export type { LoopState };
 
-/** One loop as /browse/api/loops returns it (C3). Only `key`, `lineId` and `state` are relied on to exist. */
-export type Loop = {
-  key: string;
-  subject?: string;
-  lineId: string;
-  state: LoopState;
-  client?: string | null;
-  type?: string | null;
-  owner?: string | null;
-  channel?: string | null;
-  channelId?: string | null;
-  opened?: string | null;
-  reopened?: string | null;
-  title?: string | null;
-  summary?: string | null;
-  evidence?: string[] | null;
-  proof?: string | null;
-  closed?: string | null;
-  byMessage?: string | null;
-  byUser?: string | null;
-  byName?: string | null;
-  until?: string | null;
-  note?: string | null;
-  fork?: boolean;
-  learnedAt?: string | null;
-};
+type Loose<T> = { [K in keyof T]?: T[K] | null };
+/**
+ * One loop as /browse/api/loops returns it: core/loops.ts's `LoopView`, read defensively because it
+ * arrives over HTTP. Only `key`, `lineId` and `state` are relied on to exist.
+ */
+export type Loop = Pick<LoopView, "key" | "lineId" | "state"> & Loose<Omit<LoopView, "key" | "lineId" | "state">>;
 
 export type DiscordUser = { id: string; username: string; global_name?: string | null };
 export type ComponentButton = { type: number; style?: number; label?: string; custom_id?: string; disabled?: boolean; url?: string };
@@ -127,66 +108,46 @@ export type PaIo = {
   now: () => Date;
 };
 
-// ---------- the ledger line (C1) ----------
+// ---------- the ledger line (C1): composed by core/loops.ts, its one implementation ----------
 
-const LINE_BREAKS = /[\t\n\v\f\r\u0085\u2028\u2029]/g;
-const CONTROLS = /[\u0000-\u0008\u000e-\u001f\u007f-\u0084\u0086-\u009f]/g;
-
-/** At most `max` UTF-16 units, never half an emoji. */
+/** At most `max` UTF-16 units, never half an emoji: Discord's 2,000-character limit, for display only. */
 function cutSafe(s: string, max: number): string {
   if (s.length <= max) return s;
   const out = s.slice(0, max);
   return /[\ud800-\udbff]$/.test(out) ? out.slice(0, -1) : out;
 }
 
-/** C1 `sanitise`: `|` and line breaks become spaces, other control characters go, whitespace collapses; then at most `max`. */
-export function sanitise(text: unknown, max = Infinity): string {
-  const s = String(text ?? "").replace(/\|/g, " ").replace(LINE_BREAKS, " ").replace(CONTROLS, "").replace(/\s+/g, " ").trim();
-  return Number.isFinite(max) ? cutSafe(s, max).trimEnd() : s;
-}
-
-const line = (tag: string, fields: [string, string][]) => [tag, ...fields.map(([k, v]) => `${k}=${v}`)].join(" | ");
-
 export function resolvedLine(key: string, byUser: string, byName: string, at: Date, note: string): string {
-  return line("RESOLVED/1", [["key", sanitise(key)], ["by_user", sanitise(byUser)], ["by_name", sanitise(byName)], ["resolved", at.toISOString()], ["note", sanitise(note, 300)]]);
+  return compose({ tag: "RESOLVED", key, byUser, byName, resolved: at.toISOString(), note });
 }
 
 export function parkedLine(key: string, byUser: string, byName: string, until: string, note: string): string {
-  return line("PARKED/1", [["key", sanitise(key)], ["by_user", sanitise(byUser)], ["by_name", sanitise(byName)], ["until", sanitise(until)], ["note", sanitise(note, 300)]]);
+  return compose({ tag: "PARKED", key, byUser, byName, until, note });
 }
 
-/** At most eight evidence ids; over eight, the oldest (smallest snowflake) go and the rest keep their order. */
-function newestEight(ids: unknown): string[] {
-  const list = [...new Set((Array.isArray(ids) ? ids : []).map((x) => sanitise(x).replace(/[,\s]/g, "")).filter(Boolean))];
-  if (list.length <= 8) return list;
-  const big = (s: string) => {
-    try {
-      return BigInt(s);
-    } catch {
-      return -1n;
-    }
-  };
-  const keep = new Set([...list].sort((a, b) => (big(a) < big(b) ? -1 : big(a) > big(b) ? 1 : 0)).slice(-8));
-  return list.filter((id) => keep.has(id));
-}
-
-/** An OPEN line rebuilt from a loop record, with `reopened` as given (null writes "-"). Refuses a record that lacks what OPEN needs. */
+/**
+ * The OPEN line for Reopen and Unpark, rebuilt from the loop as /loops returned it, `reopened` as
+ * given. Composing is core/loops.ts's (it refuses a bad type or time); what is the PA's: a record
+ * with no title is refused rather than reopened untitled (the new OPEN line becomes the loop's
+ * opener, so a blank title would stick), an unknown client is "internal" and an unknown owner
+ * "unclear", C1's own words for unknown.
+ */
 export function openLine(l: Loop, reopened: string | null): string {
-  const missing = (["title", "type", "opened"] as const).filter((f) => !sanitise(l[f]));
-  if (missing.length) throw new Error(`loop ${l.key} lacks ${missing.join(", ")}; an OPEN line cannot be rebuilt from it`);
-  return line("OPEN/1", [
-    ["key", sanitise(l.key)],
-    ["client", sanitise(l.client) || "internal"],
-    ["type", sanitise(l.type)],
-    ["owner", sanitise(l.owner) || "unclear"],
-    ["channel", sanitise(l.channel) || "-"],
-    ["channel_id", sanitise(l.channelId) || "-"],
-    ["opened", sanitise(l.opened)],
-    ["reopened", reopened ? sanitise(reopened) : "-"],
-    ["title", sanitise(l.title, 120)],
-    ["summary", sanitise(l.summary, 300)],
-    ["evidence", newestEight(l.evidence).join(",")],
-  ]);
+  if (!sanitise(l.title, LIMITS.title)) throw new Error(`loop ${l.key} has no title; an OPEN line is not rebuilt without one`);
+  return compose({
+    tag: "OPEN",
+    key: l.key,
+    client: l.client || "internal",
+    type: (l.type ?? "") as LoopType,
+    owner: l.owner || "unclear",
+    channel: l.channel ?? "",
+    channelId: l.channelId ?? "",
+    opened: l.opened ?? "",
+    reopened,
+    title: l.title ?? "",
+    summary: l.summary ?? "",
+    evidence: l.evidence ?? [],
+  });
 }
 
 const PROOF_RE = /^https:\/\/discord\.com\/channels\/([^/\s]+)\/(\d+)\/(\d+)$/;
@@ -199,7 +160,7 @@ export function openerSource(proof: unknown): string | undefined {
 
 // ---------- reading loops (C3) ----------
 
-const STATES = new Set<string>(["open", "parked", "closed", "resolved"]);
+const STATES = new Set<string>(LOOP_STATES);
 
 type Read = { loops: Loop[]; unreadable: number; total: number };
 
