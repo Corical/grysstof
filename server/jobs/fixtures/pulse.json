@@ -1,0 +1,35 @@
+{
+  "tenant": "xactco",
+  "looseEndsTotal": 1,
+  "looseEnds": [
+    {
+      "id": "thought-p1",
+      "source": "discord:268128051500417024/1300000000000000101/1564262321356804096",
+      "channel": "servest",
+      "author": "Thabo",
+      "text": "Who can reset my password?",
+      "at": "2026-10-26T13:00:00.000Z",
+      "client": "client:servest"
+    }
+  ],
+  "mapping": [
+    {
+      "channel": "dev-internal",
+      "client": null,
+      "how": "auto",
+      "messages": 1
+    },
+    {
+      "channel": "servest",
+      "client": "client:servest",
+      "how": "auto",
+      "messages": 4
+    },
+    {
+      "channel": "swanzo",
+      "client": "client:swanzo",
+      "how": "auto",
+      "messages": 6
+    }
+  ]
+}

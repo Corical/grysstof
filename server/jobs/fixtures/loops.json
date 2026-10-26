@@ -1,0 +1,117 @@
+{
+  "loops": [
+    {
+      "key": "1559838169497604096",
+      "subject": "loop:1559838169497604096",
+      "lineId": "fact_x1",
+      "state": "open",
+      "client": "servest",
+      "type": "unanswered_question",
+      "owner": "unclear",
+      "channel": "servest",
+      "channelId": "1300000000000000101",
+      "opened": "2026-10-14T08:00:00.000Z",
+      "reopened": null,
+      "title": "Site list export for Servest",
+      "summary": "Site list export for Servest.",
+      "evidence": [
+        "1559838169497604096"
+      ],
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000101/1559838169497604096",
+      "closed": null,
+      "byMessage": null,
+      "byUser": null,
+      "byName": null,
+      "until": null,
+      "note": null,
+      "fork": false,
+      "learnedAt": "2026-10-15T05:30:00.000Z"
+    },
+    {
+      "key": "1560200557363204096",
+      "subject": "loop:1560200557363204096",
+      "lineId": "fact_pk",
+      "state": "parked",
+      "client": "servest",
+      "type": "unanswered_question",
+      "owner": "Kelli",
+      "channel": "servest",
+      "channelId": "1300000000000000101",
+      "opened": "2026-10-15T08:00:00.000Z",
+      "reopened": null,
+      "title": "Quarterly review pack for Servest",
+      "summary": "Quarterly review pack for Servest.",
+      "evidence": [
+        "1560200557363204096"
+      ],
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000101/1560200557363204096",
+      "closed": null,
+      "byMessage": null,
+      "byUser": "900000000000000001",
+      "byName": "kelli",
+      "until": "2026-11-02",
+      "note": "after the QBR",
+      "fork": false,
+      "learnedAt": "2026-10-16T05:30:00.000Z"
+    },
+    {
+      "key": "1562344685568004096",
+      "subject": "loop:1562344685568004096",
+      "lineId": "fact_w0c",
+      "state": "closed",
+      "client": "swanzo",
+      "type": "unanswered_question",
+      "owner": "Devon",
+      "channel": "swanzo",
+      "channelId": "1300000000000000102",
+      "opened": "2026-10-21T06:00:00.000Z",
+      "reopened": null,
+      "title": "Supervisor access for Zola",
+      "summary": "Supervisor access for Zola.",
+      "evidence": [
+        "1562344685568004096"
+      ],
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000102/1562344685568004096",
+      "closed": "2026-10-21T07:00:00.000Z",
+      "byMessage": "1562359785062404096",
+      "byUser": null,
+      "byName": null,
+      "until": null,
+      "note": null,
+      "fork": false,
+      "learnedAt": "2026-10-22T05:30:00.000Z"
+    },
+    {
+      "key": "1563099660288004096",
+      "subject": "loop:1563099660288004096",
+      "lineId": "fact_w1",
+      "state": "open",
+      "client": "swanzo",
+      "type": "unanswered_question",
+      "owner": "Devon",
+      "channel": "swanzo",
+      "channelId": "1300000000000000102",
+      "opened": "2026-10-23T08:00:00.000Z",
+      "reopened": null,
+      "title": "6498 export fails on large sites",
+      "summary": "6498 export fails on large sites.",
+      "evidence": [
+        "1563099660288004096"
+      ],
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000102/1563099660288004096",
+      "closed": null,
+      "byMessage": null,
+      "byUser": null,
+      "byName": null,
+      "until": null,
+      "note": null,
+      "fork": false,
+      "learnedAt": "2026-10-26T05:30:00.000Z"
+    }
+  ],
+  "unreadable": [],
+  "warnings": {
+    "understandFailed": 0
+  },
+  "total": 4
+}
