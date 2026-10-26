@@ -4,9 +4,10 @@
  * nobody has superseded is the loop's state. Pure: lines and facts in, plain objects out, no clock
  * of its own (callers pass `now`), no I/O, so every rule is tested directly.
  *
- * C1 (the line), C2 (the key and its generations) and C3 (what /browse/api/loops returns) are
- * written in the plan; this file is their only implementation in the server. A line that cannot
- * be read is reported as unreadable, never dropped.
+ * C1 (the line and the key grammar) and C3 (what /browse/api/loops returns) are written in the
+ * plan; this file is their reference implementation. The job's sanitiser is held to it by
+ * tests/fixtures/c1-sanitise.json. C2 and C5 (generations, what may close a loop) belong to the
+ * job (plan v3.1 addendum). A line that cannot be read is reported as unreadable, never dropped.
  */
 import type { Fact } from "./ports/mod.ts";
 
@@ -15,6 +16,13 @@ export const LOOP_TYPES = ["unanswered_question", "unkept_promise", "stale_follo
 export type LoopType = typeof LOOP_TYPES[number];
 export const LOOP_STATES = ["open", "parked", "closed", "resolved"] as const;
 export type LoopState = typeof LOOP_STATES[number];
+
+/**
+ * The key grammar, one owner (addendum, row 30): the opener's Discord message id (17 to 20 digits),
+ * an optional letter for a second ask in one message, an optional generation of 1 to 3 digits.
+ * The longest key is 26 characters. A subject or a line with any other key is unreadable.
+ */
+export const KEY_RE = /^\d{17,20}(:[a-z])?(:\d{1,3})?$/;
 
 /**
  * Caps on what a line may carry. Title, summary, note, reason and evidence are C1's. Names
@@ -101,9 +109,17 @@ export function sanitiseLine(line: LoopLine): LoopLine {
   }
 }
 
-/** An ISO 8601 date or instant: the same rule the Memory port applies to since/until. */
+/**
+ * An ISO 8601 date or instant whose calendar date exists. Date.parse rolls 2026-02-30 over to
+ * 2 March; a reader in another language refuses it; so it is refused here too (row 15).
+ */
 export function isInstant(v: unknown): boolean {
-  return typeof v === "string" && /^\d{4}-\d{2}-\d{2}/.test(v) && !Number.isNaN(Date.parse(v));
+  if (typeof v !== "string") return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(v);
+  if (!m || Number.isNaN(Date.parse(v))) return false;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const day = new Date(Date.UTC(y, mo - 1, d));
+  return day.getUTCFullYear() === y && day.getUTCMonth() === mo - 1 && day.getUTCDate() === d;
 }
 
 function fieldsOf(line: LoopLine): Record<string, string> {
@@ -125,6 +141,7 @@ function fieldsOf(line: LoopLine): Record<string, string> {
 /** Why these fields do not make a readable line of this tag, or null when they do. */
 function invalid(tag: Tag, f: Record<string, string>): string | null {
   if (!f.key) return "key is blank";
+  if (!KEY_RE.test(f.key)) return `key "${f.key.slice(0, 40)}" does not match the key grammar`;
   const when = (name: string) => (isInstant(f[name]) ? null : `${name} is not an ISO 8601 time: "${f[name].slice(0, 40)}"`);
   switch (tag) {
     case "OPEN":
@@ -245,12 +262,15 @@ function openerOf(head: Fact, history: Fact[], key: string): { fact: Fact; line:
 /**
  * One loop from every line of its subject, in any order. The head is the newest line nobody has
  * superseded; two or more such lines are a fork, read as the newest and reported (C2 rule 4).
+ * A subject whose key is outside KEY_RE is unreadable (row 19): no button and no job could act on it.
  */
 export function readLoop(subject: string, history: Fact[]): Read {
   const key = subject.startsWith(LOOP_PREFIX) ? subject.slice(LOOP_PREFIX.length) : "";
   const bad = (lineId: string, reason: string): Read => ({ ok: false, unreadable: { subject, lineId, reason } });
   const heads = history.filter((f) => !f.supersededBy).sort(newestFirst);
-  if (!heads.length) return bad([...history].sort(newestFirst)[0]?.id ?? "", "every line is superseded; no current line");
+  const newest = heads[0] ?? [...history].sort(newestFirst)[0];
+  if (!KEY_RE.test(key)) return bad(newest?.id ?? "", `key "${key.slice(0, 40)}" does not match the key grammar`);
+  if (!heads.length) return bad(newest?.id ?? "", "every line is superseded; no current line");
   const head = heads[0];
   const read = readable(head, key);
   if (!read.ok) return bad(head.id, read.reason);
@@ -266,52 +286,61 @@ export function readLoop(subject: string, history: Fact[]): Read {
     fork: heads.length > 1, learnedAt: head.learnedAt,
   };
   if (line.tag === "CLOSED") Object.assign(loop, { closed: line.closed, byMessage: line.byMessage, note: line.reason });
-  if (line.tag === "RESOLVED") Object.assign(loop, { closed: line.resolved, byUser: line.byUser, byName: line.byName, note: line.note });
+  // A press's own clock (or a hand-written future time) must not decide when the loop finished (row 17).
+  if (line.tag === "RESOLVED") Object.assign(loop, { closed: earlier(line.resolved, head.learnedAt), byUser: line.byUser, byName: line.byName, note: line.note });
   if (line.tag === "PARKED") Object.assign(loop, { until: line.until, byUser: line.byUser, byName: line.byName, note: line.note });
   return { ok: true, loop };
 }
 
-// --- the query (C3) ---
+/** The earlier of two instants, as written. */
+const earlier = (a: string, b: string) => (Date.parse(b) < Date.parse(a) ? b : a);
 
-export type LoopQuery = { states: LoopState[]; since?: string; client?: string; limit: number };
+// --- the query (C3, with the v3.1 addendum) ---
 
-/** The route's parameters checked: state open (default), parked, closed, resolved or all; since ISO 8601 or absent. */
-export function loopQuery(p: { state?: string; since?: string; client?: string; limit: number }): LoopQuery {
-  const state = p.state ?? "open";
+export type LoopQuery = { states: LoopState[]; since?: string; client?: string; key?: string; offset: number; limit: number };
+
+/**
+ * The route's parameters checked. state: open (the default), parked, closed, resolved or all; with
+ * `key` the default is all, so a press re-reading its loop finds it in whatever state it is now.
+ * since: ISO 8601. key: KEY_RE. offset: a whole number. Anything else is an Error (a 400).
+ */
+export function loopQuery(p: { state?: string; since?: string; client?: string; key?: string; offset?: string; limit: number }): LoopQuery {
+  if (p.key !== undefined && !KEY_RE.test(p.key)) throw new Error(`key must match the key grammar (a Discord message id, then optional :letter and :generation), got "${p.key.slice(0, 40)}"`);
+  const state = p.state ?? (p.key !== undefined ? "all" : "open");
   let states: LoopState[];
   if (state === "all") states = [...LOOP_STATES];
   else if ((LOOP_STATES as readonly string[]).includes(state)) states = [state as LoopState];
   else throw new Error(`state must be one of ${LOOP_STATES.join(", ")} or all, got "${state.slice(0, 40)}"`);
   if (p.since !== undefined && !isInstant(p.since)) throw new Error(`since must be an ISO 8601 timestamp, got "${p.since.slice(0, 40)}"`);
+  if (p.offset !== undefined && !/^\d+$/.test(p.offset)) throw new Error(`offset must be a whole number ≥ 0, got "${p.offset.slice(0, 40)}"`);
   const client = p.client?.trim() || undefined;
   const limit = Number.isFinite(p.limit) ? Math.max(0, Math.floor(p.limit)) : 0;
-  return { states, ...(p.since !== undefined ? { since: p.since } : {}), ...(client ? { client } : {}), limit };
+  return {
+    states, ...(p.since !== undefined ? { since: p.since } : {}), ...(client ? { client } : {}), ...(p.key !== undefined ? { key: p.key } : {}),
+    offset: p.offset !== undefined ? Number(p.offset) : 0, limit,
+  };
 }
 
 const clientKey = (c: string) => c.trim().toLowerCase().replace(/^client:/, "");
-
-/** When the loop entered its current state: the close for closed and resolved, the (re)opening for open, the write for parked. */
-function stateTime(l: LoopView): number {
-  const at = l.state === "closed" || l.state === "resolved" ? l.closed : l.state === "parked" ? l.learnedAt : (l.reopened ?? l.opened);
-  return Date.parse(at ?? "");
-}
+const finished = (l: LoopView) => l.state === "closed" || l.state === "resolved";
 
 /**
- * The loops a query asks for, sorted by (opened, key) ascending, cut to `limit`; `total` is the
- * count before the cut. Without `since`, closed and resolved loops older than 30 days are left out.
+ * The loops a query asks for, sorted by (opened instant, key in code-point order), the page at
+ * `offset` of `limit`; `total` counts every match. `since` narrows closed and resolved loops only,
+ * by when they finished; open and parked loops ignore it (row 14). Without `since`, finished loops
+ * older than 30 days are left out, unless one loop is asked for by `key`.
  */
 export function selectLoops(loops: LoopView[], q: LoopQuery, now: Date): { loops: LoopView[]; total: number } {
-  const since = q.since !== undefined ? Date.parse(q.since) : undefined;
-  const finishedFrom = now.getTime() - FINISHED_WINDOW_DAYS * 86_400_000;
+  const from = q.since !== undefined ? Date.parse(q.since) : q.key !== undefined ? undefined : now.getTime() - FINISHED_WINDOW_DAYS * 86_400_000;
   const client = q.client !== undefined ? clientKey(q.client) : undefined;
   const kept = loops.filter((l) => {
     if (!q.states.includes(l.state)) return false;
+    if (q.key !== undefined && l.key !== q.key) return false;
     if (client !== undefined && clientKey(l.client) !== client) return false;
-    if (since !== undefined) return stateTime(l) >= since;
-    if (l.state === "closed" || l.state === "resolved") return stateTime(l) >= finishedFrom;
+    if (from !== undefined && finished(l)) return Date.parse(l.closed ?? "") >= from;
     return true;
   });
   kept.sort((a, b) => (Date.parse(a.opened) - Date.parse(b.opened)) || codePoint(a.key, b.key));
-  return { loops: kept.slice(0, q.limit), total: kept.length };
+  return { loops: kept.slice(q.offset, q.offset + q.limit), total: kept.length };
 }
 
