@@ -30,7 +30,7 @@
 import type { Capture, Reaction, Watermarks } from "../writer/discord.ts";
 import { createBot } from "../writer/discord-dispatch.ts";
 import { type PaIo, paConfig, parseIdList } from "../writer/discord-pa.ts";
-import { browseHistory, browseLoops, discordClient, type HttpDeps, mcpCapture, mcpTool } from "../writer/discord-rest.ts";
+import { browseHistory, browseLoops, discordClient, HttpError, type HttpDeps, mcpCapture, mcpTool } from "../writer/discord-rest.ts";
 
 const API = "https://discord.com/api/v10";
 const INTENTS = (1 << 0) | (1 << 9) | (1 << 10) | (1 << 15); // GUILDS, GUILD_MESSAGES, GUILD_MESSAGE_REACTIONS, MESSAGE_CONTENT
@@ -64,7 +64,8 @@ async function rest<T>(path: string): Promise<T> {
       await new Promise((r) => setTimeout(r, wait));
       continue;
     }
-    if (!res.ok) throw new Error(`discord ${path} -> ${res.status}`);
+    // Same text as before ("discord <path> -> 403"); the status is now also a field the backfill reads.
+    if (!res.ok) throw new HttpError(res.status, "", `discord ${path}`);
     return await res.json() as T;
   }
 }

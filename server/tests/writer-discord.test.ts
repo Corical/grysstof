@@ -1,6 +1,6 @@
 import { assert, assertEquals } from "@std/assert";
 import { advance, type Capture, describeReactions, type DiscordAuthor, type DiscordMessage, distil, emojiKey, newer, reactionsOf, type Watermarks } from "../writer/discord.ts";
-import { backoffMs, type BotIo, createBot, GUILD_WAIT_MS, RETRY_BASE_MS, RETRY_MAX_MS } from "../writer/discord-dispatch.ts";
+import { backoffMs, type BotIo, createBot, GUILD_WAIT_MS, HOLD_MAX_MS, RETRY_BASE_MS, RETRY_MAX_MS } from "../writer/discord-dispatch.ts";
 import { type PaConfig, paConfig, type PaIo, parseIdList } from "../writer/discord-pa.ts";
 import { HttpError } from "../writer/discord-rest.ts";
 
@@ -206,7 +206,21 @@ const said = (id: string, channel: string, guild?: string): DiscordMessage => ({
   timestamp: "2026-10-26T08:00:00.000Z",
 });
 
-type World = Record<string, { guild: string; messages: DiscordMessage[]; lookupFails?: number; pageFails?: number }>;
+/**
+ * A fake Discord per channel. `pageFails`: the first n page fetches fail with 502. `pageStatus(n)`:
+ * the status the nth page fetch fails with, or undefined to answer. `lookupFails`/`lookupStatus`: the
+ * same for /channels/<id>. `plainErrors`: failures are thrown as the old entry `rest` threw them
+ * (an Error whose text ends "-> 403"), not as an HttpError.
+ */
+type World = Record<string, {
+  guild: string;
+  messages: DiscordMessage[];
+  lookupFails?: number;
+  lookupStatus?: number;
+  pageFails?: number;
+  pageStatus?: (n: number) => number | undefined;
+  plainErrors?: boolean;
+}>;
 
 const boom = () => {
   throw new Error("boom");
@@ -221,12 +235,17 @@ function botHarness(opts: { allow?: string; marks?: Watermarks; world: World; pa
   const logs: Record<string, unknown>[] = [];
   const lookups: Record<string, number> = {};
   const pagesAsked: Record<string, number> = {};
+  const fail = (ch: string, status: number, path: string): never => {
+    throw opts.world[ch]?.plainErrors ? new Error(`discord ${path} -> ${status}`) : new HttpError(status, "", `discord ${path}`);
+  };
   const rest = async <T>(path: string): Promise<T> => {
     restCalls.push(path);
     let m = /^\/channels\/(\d+)\/messages\?after=(\d+)&limit=100$/.exec(path);
     if (m) {
-      pagesAsked[m[1]] = (pagesAsked[m[1]] ?? 0) + 1;
-      if (pagesAsked[m[1]] <= (opts.world[m[1]]?.pageFails ?? 0)) throw new Error(`discord /channels/${m[1]}/messages -> 502`);
+      const n = pagesAsked[m[1]] = (pagesAsked[m[1]] ?? 0) + 1;
+      if (n <= (opts.world[m[1]]?.pageFails ?? 0)) fail(m[1], 502, path);
+      const status = opts.world[m[1]]?.pageStatus?.(n);
+      if (status !== undefined) fail(m[1], status, path);
       return (opts.world[m[1]]?.messages ?? []).filter((x) => BigInt(x.id) > BigInt(m![2])).slice(0, 100).reverse() as T; // newest first, as Discord pages
     }
     if (/^\/channels\/\d+\/messages\?limit=100/.test(path)) return [] as T;
@@ -238,7 +257,7 @@ function botHarness(opts: { allow?: string; marks?: Watermarks; world: World; pa
     if (m) {
       const ch = opts.world[m[1]];
       lookups[m[1]] = (lookups[m[1]] ?? 0) + 1;
-      if (!ch || lookups[m[1]] <= (ch.lookupFails ?? 0)) throw new Error(`discord /channels/${m[1]} -> 503`);
+      if (!ch || lookups[m[1]] <= (ch.lookupFails ?? 0)) fail(m[1], ch?.lookupStatus ?? 503, path);
       return { id: m[1], name: `c${m[1].slice(-1)}`, type: 0, guild_id: ch.guild } as T;
     }
     throw new Error(`unexpected ${path}`);
@@ -271,6 +290,7 @@ function botHarness(opts: { allow?: string; marks?: Watermarks; world: World; pa
     logs,
     lookups: () => restCalls.filter((p) => /^\/channels\/\d+$/.test(p)),
     pages: () => restCalls.filter((p) => p.includes("messages?after=")),
+    pagesAsked: (ch: string) => pagesAsked[ch] ?? 0,
     ids: (ch: string) => posted.filter((p) => p.channelId === ch).map((p) => p.source.split("/").pop()),
     events: (name: string) => logs.filter((l) => l.event === name),
   };
@@ -355,6 +375,91 @@ Deno.test("dispatch: a backfill page that fails holds its channel, list or no li
   assertEquals(h.ids(C1), [M(101), M(102), M(103)]);
   assertEquals(h.bot.marks()[C1], M(103));
   assertEquals(h.timers.pending(), 0, "the retry timer was cancelled once the live message released the channel");
+});
+
+Deno.test("dispatch: a channel the bot may not read (403) or that is gone (404) is logged once as backfill.forbidden and never retried this run, its watermark untouched", async () => {
+  const world: World = {
+    [C1]: { guild: G1, pageStatus: () => 403, messages: [said(M(101), C1)] },
+    [C2]: { guild: G1, pageStatus: () => 404, plainErrors: true, messages: [said(M(101), C2)] }, // the text form the old entry rest threw
+    [C3]: { guild: G1, messages: [said(M(101), C3)] },
+  };
+  const h = botHarness({ marks: { [C1]: M(100), [C2]: M(100), [C3]: M(100) }, world });
+  await h.bot.dispatch("READY", { guilds: [] });
+  await h.bot.settled();
+  assertEquals(h.events("backfill.forbidden").map((l) => [l.channel, l.status]), [[C1, 403], [C2, 404]]);
+  assertEquals(h.events("backfill.failed"), []);
+  assertEquals(h.bot.deferred(), []);
+  assertEquals(h.timers.pending(), 0, "no retry scheduled");
+  assertEquals(h.ids(C3), [M(101)], "a readable channel is not held up by them");
+  await h.timers.advance(24 * 3_600_000);
+  await h.bot.dispatch("READY", { guilds: [] }); // a reconnect within the same run
+  await h.bot.settled();
+  assertEquals([h.pagesAsked(C1), h.pagesAsked(C2)], [1, 1], "asked once, never again this run");
+  assertEquals(h.events("backfill.forbidden").length, 2, "logged once each");
+  assertEquals(h.bot.marks(), { [C1]: M(100), [C2]: M(100), [C3]: M(101) });
+  assert(!h.restCalls.some((p) => p.startsWith(`/channels/${C1}/messages?limit`) || p.startsWith(`/channels/${C2}/messages?limit`)), "reaction catch-up leaves them alone too");
+  await h.bot.dispatch("MESSAGE_CREATE", said(M(150), C1, G1));
+  await h.bot.settled();
+  assertEquals(h.ids(C1), [M(150)], "a live message there is captured as it comes, as before round 2");
+  assertEquals(h.pagesAsked(C1), 1);
+});
+
+Deno.test("dispatch: a transient failure (503) is retried with delays doubling from 30 s to a cap of 10 minutes, the attempt number rising each time", async () => {
+  const world: World = { [C1]: { guild: G1, pageStatus: () => 503, messages: [said(M(101), C1)] } };
+  const h = botHarness({ marks: { [C1]: M(100) }, world });
+  await h.bot.dispatch("READY", { guilds: [] });
+  await h.bot.settled();
+  await h.timers.advance(RETRY_BASE_MS - 1);
+  assertEquals(h.pagesAsked(C1), 1, "no retry before its time");
+  for (const wait of [1, 60_000, 120_000, 240_000, 480_000, 600_000, 600_000]) {
+    await h.timers.advance(wait);
+    await h.bot.settled();
+  }
+  assertEquals(h.events("backfill.failed").map((l) => [l.attempt, l.retryInMs, l.status]), [
+    [1, 30_000, 503],
+    [2, 60_000, 503],
+    [3, 120_000, 503],
+    [4, 240_000, 503],
+    [5, 480_000, 503],
+    [6, 600_000, 503],
+    [7, 600_000, 503],
+    [8, 600_000, 503],
+  ]);
+  assertEquals(HOLD_MAX_MS, 600_000);
+  assertEquals(h.pagesAsked(C1), 8);
+  assertEquals(h.bot.deferred(), [C1]);
+  assertEquals(h.bot.marks()[C1], M(100));
+  assertEquals(h.events("backfill.forbidden"), []);
+});
+
+Deno.test("dispatch: a channel that fails and then answers is backfilled and let go, and a later failure starts again at attempt 1", async () => {
+  const world: World = { [C1]: { guild: G1, pageStatus: (n) => (n <= 2 || n === 4 ? 503 : undefined), messages: [said(M(101), C1), said(M(102), C1)] } };
+  const h = botHarness({ marks: { [C1]: M(100) }, world });
+  await h.bot.dispatch("READY", { guilds: [] });
+  await h.bot.settled();
+  await h.timers.advance(RETRY_BASE_MS);
+  await h.bot.settled();
+  await h.timers.advance(2 * RETRY_BASE_MS);
+  await h.bot.settled();
+  assertEquals(h.ids(C1), [M(101), M(102)]);
+  assertEquals(h.bot.deferred(), []);
+  assertEquals(h.timers.pending(), 0);
+  assertEquals(h.events("backfill.released").map((l) => l.channel), [C1]);
+  await h.bot.dispatch("READY", { guilds: [] }); // a reconnect; this time the first page fails again
+  await h.bot.settled();
+  assertEquals(h.events("backfill.failed").map((l) => [l.attempt, l.retryInMs]), [[1, 30_000], [2, 60_000], [1, 30_000]]);
+});
+
+Deno.test("dispatch: with the allowlist set, a channel whose guild lookup answers 404 is forbidden for the run, not held", async () => {
+  const world: World = { [C3]: { guild: G1, lookupFails: 99, lookupStatus: 404, messages: [said(M(101), C3)] } };
+  const h = botHarness({ allow: G1, marks: { [C3]: M(100) }, world });
+  await h.bot.dispatch("READY", { guilds: [] });
+  await h.bot.settled();
+  assertEquals(h.events("backfill.forbidden").map((l) => [l.channel, l.status]), [[C3, 404]]);
+  assertEquals(h.events("backfill.guild_unknown"), []);
+  assertEquals(h.bot.deferred(), []);
+  assertEquals(h.timers.pending(), 0);
+  assertEquals(h.bot.marks()[C3], M(100));
 });
 
 Deno.test("dispatch: without DISCORD_CAPTURE_GUILDS nothing changes: backfill starts at READY without waiting and every guild is captured", async () => {
