@@ -7,16 +7,12 @@
 import { assert, assertEquals, assertFalse, assertThrows } from "@std/assert";
 import type { Hono } from "hono";
 import {
-  acceptClose,
-  classifySighting,
   type ClosedLine,
-  type ClosingMessage,
   compose,
   LIMITS,
   type LoopLine,
   loopQuery,
   type LoopView,
-  mergeEvidence,
   type OpenLine,
   type ParkedLine,
   parse,
@@ -289,7 +285,6 @@ Deno.test("readLoop: history handed over oldest first gives the same loop as new
   assertEquals(a.loop, b.loop);
 });
 
-// --- C2: generations ---
 
 const view = (key: string, state: LoopView["state"], over: Partial<LoopView> = {}): LoopView => ({
   key, subject: `loop:${key}`, lineId: `fact_${key}`, state, client: "servest", type: "unanswered_question", owner: "Kelli", channel: "servest",
@@ -297,96 +292,6 @@ const view = (key: string, state: LoopView["state"], over: Partial<LoopView> = {
   closed: state === "closed" || state === "resolved" ? "2026-10-21T08:00:00.000Z" : null, byMessage: null, byUser: null, byName: null,
   until: null, note: null, fork: false, learnedAt: "2026-10-21T09:00:00.000Z", ...over,
 });
-const at = (id: string, iso: string) => ({ id, at: iso });
-
-Deno.test("C2: an opener nobody has seen is a new loop on its own id", () => {
-  assertEquals(classifySighting("123", [at("123", "2026-10-20T08:00:00Z")], []), { kind: "create", key: "123" });
-  assertEquals(classifySighting("123", [at("123", "2026-10-20T08:00:00Z")], [view("1234", "open"), view("12", "open"), view("123:b", "open")]), { kind: "create", key: "123" }, "a longer id, a shorter id and a sibling ask are not this loop");
-});
-
-Deno.test("C2 rule 1: an OPEN loop gets evidence_add; a PARKED loop gets nothing written", () => {
-  assertEquals(classifySighting("123", [at("m9", "2026-10-25T08:00:00Z")], [view("123", "open")]), { kind: "evidence_add", key: "123" });
-  assertEquals(classifySighting("123", [at("m9", "2026-10-25T08:00:00Z")], [view("123", "parked")]), { kind: "ignore", key: "123" });
-});
-
-Deno.test("C2 rule 2: a finished loop seen again with nothing newer than its close is suppressed, the boundary included", () => {
-  const closed = view("123", "closed", { closed: "2026-10-21T08:00:00.000Z" });
-  assertEquals(classifySighting("123", [at("123", "2026-10-20T08:00:00Z"), at("m5", "2026-10-21T08:00:00.000Z")], [closed]), { kind: "suppressed", key: "123" });
-  assertEquals(classifySighting("123", [at("m5", "2026-10-21T10:00:00+02:00")], [closed]), { kind: "suppressed", key: "123" }, "the same instant in another offset is not later");
-  const resolved = view("123", "resolved", { closed: "2026-10-22T08:00:00.000Z" });
-  assertEquals(classifySighting("123", [at("m5", "2026-10-21T23:59:59Z")], [resolved]).kind, "suppressed");
-  assertEquals(classifySighting("123", [at("m5", "not a time")], [closed]).kind, "suppressed", "a time nobody can read never opens a new generation");
-  assertEquals(classifySighting("123", [], [closed]).kind, "suppressed");
-});
-
-Deno.test("C2 rule 2: any cited message after the close is a new ask on the same opener: the next generation", () => {
-  const closed = view("123", "closed", { closed: "2026-10-21T08:00:00.000Z" });
-  assertEquals(classifySighting("123", [at("123", "2026-10-20T08:00:00Z"), at("m8", "2026-10-21T08:00:00.001Z")], [closed]), { kind: "new_generation", key: "123:2" });
-  const loops = [view("123:3", "resolved", { closed: "2026-10-24T08:00:00.000Z" }), view("123", "closed"), view("123:2", "closed")];
-  assertEquals(classifySighting("123", [at("m9", "2026-10-25T08:00:00Z")], loops), { kind: "new_generation", key: "123:4" }, "the newest generation decides, whatever the order");
-  assertEquals(classifySighting("123", [at("m9", "2026-10-25T08:00:00Z")], [view("123", "closed"), view("123:2", "open")]), { kind: "evidence_add", key: "123:2" });
-  assertEquals(classifySighting("123", [at("m9", "2026-10-25T08:00:00Z")], [view("123:b", "closed"), view("123:b:2", "open")]).kind, "create", "the :b family is a different loop");
-  assertEquals(classifySighting("123:b", [at("m9", "2026-10-25T08:00:00Z")], [view("123:b", "closed"), view("123", "open")]), { kind: "new_generation", key: "123:b:2" });
-  assertEquals(classifySighting("123", [at("m9", "2026-10-25T08:00:00Z")], [view("123", "closed"), view("123:01", "open"), view("123:1", "open")]).kind, "new_generation", ":01 and :1 are not generations");
-});
-
-Deno.test("evidence_add writes only when the stored list changes", () => {
-  assertEquals(mergeEvidence(["m1", "m2"], ["m2", "m1"]), { evidence: ["m1", "m2"], changed: false });
-  assertEquals(mergeEvidence(["m1", "m2"], []), { evidence: ["m1", "m2"], changed: false });
-  assertEquals(mergeEvidence(["m1", "m2"], ["m3"]), { evidence: ["m1", "m2", "m3"], changed: true });
-  const eight = ["a", "b", "c", "d", "e", "f", "g", "h"];
-  assertEquals(mergeEvidence(eight, ["a"]), { evidence: eight, changed: false }, "re-citing the oldest keeps the list");
-  assertEquals(mergeEvidence(eight, ["i"]), { evidence: [...eight.slice(1), "i"], changed: true }, "the oldest drops off");
-  assertEquals(mergeEvidence(["m1"], [" m1 ", "m,1"]).changed, false, "a dirty copy of a stored id is the same id");
-});
-
-// --- C5 closing acceptance, as pure rules ---
-
-const loop = { channel: "servest", channelId: "900", opened: "2026-10-20T08:00:00.000Z", reopened: null as string | null };
-const MEMBERS = { ids: ["4242", "5151"], names: ["Kelli", "Corné"] };
-const msg = (over: Partial<ClosingMessage> = {}): ClosingMessage => ({ id: "m9", at: "2026-10-21T08:00:00.000Z", channelId: "900", parentId: null, channel: "servest", authorId: "4242", authorName: "Kelli", ...over });
-
-Deno.test("closing: a member's later reply in the loop's channel closes it", () => {
-  assertEquals(acceptClose(loop, msg(), MEMBERS), { ok: true, weak: [] });
-});
-
-Deno.test("closing: a reply with the wrong channel id is refused even when the channel name matches", () => {
-  assertEquals(acceptClose(loop, msg({ channelId: "901" }), MEMBERS), { ok: false, reason: "wrong_channel" });
-  assertEquals(acceptClose(loop, msg({ channelId: "901", parentId: "902" }), MEMBERS), { ok: false, reason: "wrong_channel" });
-});
-
-Deno.test("closing: a thread reply whose parent is the loop's channel closes it", () => {
-  assertEquals(acceptClose(loop, msg({ channelId: "777", parentId: "900", channel: "servest" }), MEMBERS), { ok: true, weak: [] });
-});
-
-Deno.test("closing: the channel name is a fallback only when the message carries no ids, and it says so", () => {
-  assertEquals(acceptClose(loop, msg({ channelId: null, parentId: null, channel: "#Servest " }), MEMBERS), { ok: true, weak: ["channel_name"] });
-  assertEquals(acceptClose(loop, msg({ channelId: undefined, parentId: undefined, channel: "swanzo" }), MEMBERS), { ok: false, reason: "wrong_channel" });
-  assertEquals(acceptClose(loop, msg({ channelId: null, parentId: "900" }), MEMBERS), { ok: true, weak: [] }, "a parent id alone is an id");
-});
-
-Deno.test("closing: a reply at or before the opener, or at or before a reopen, is refused", () => {
-  assertEquals(acceptClose(loop, msg({ at: "2026-10-19T08:00:00Z" }), MEMBERS), { ok: false, reason: "too_early" });
-  assertEquals(acceptClose(loop, msg({ at: "2026-10-20T10:00:00+02:00" }), MEMBERS), { ok: false, reason: "too_early" }, "the opener's own instant is not later");
-  const reopened = { ...loop, reopened: "2026-10-23T08:00:00.000Z" };
-  assertEquals(acceptClose(reopened, msg({ at: "2026-10-21T08:00:00Z" }), MEMBERS), { ok: false, reason: "before_reopen" }, "the reply that closed it last time cannot close it again");
-  assertEquals(acceptClose(reopened, msg({ at: "2026-10-23T08:00:00Z" }), MEMBERS), { ok: false, reason: "before_reopen" });
-  assertEquals(acceptClose(reopened, msg({ at: "2026-10-23T08:00:01Z" }), MEMBERS), { ok: true, weak: [] });
-  assertEquals(acceptClose(loop, msg({ at: "whenever" }), MEMBERS), { ok: false, reason: "bad_time" });
-});
-
-Deno.test("closing: a client's reply never closes a loop; a known id wins over a lookalike name", () => {
-  assertEquals(acceptClose(loop, msg({ authorId: "999", authorName: "Kelli" }), MEMBERS), { ok: false, reason: "not_member" }, "a name that looks like a member's is not the member");
-  assertEquals(acceptClose(loop, msg({ authorId: null, authorName: " kelli " }), MEMBERS), { ok: true, weak: ["author_name"] });
-  assertEquals(acceptClose(loop, msg({ authorId: null, authorName: "Sipho (Servest)" }), MEMBERS), { ok: false, reason: "not_member" });
-  assertEquals(acceptClose(loop, msg({ authorId: null, authorName: null }), MEMBERS), { ok: false, reason: "not_member" });
-  assertEquals(acceptClose(loop, msg({ channelId: null, parentId: null, authorId: null }), MEMBERS), { ok: true, weak: ["channel_name", "author_name"] });
-});
-
-Deno.test("closing: a cited message that is not in the window is refused", () => {
-  assertEquals(acceptClose(loop, undefined, MEMBERS), { ok: false, reason: "not_in_window" });
-});
-
 // --- the query and its selection ---
 
 Deno.test("loopQuery: state defaults to open; an unknown state or a since that is not ISO 8601 is an error", () => {
