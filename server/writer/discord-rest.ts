@@ -149,26 +149,39 @@ export function mcpText(raw: string): McpAnswer {
   throw new Error(`unreadable answer from Grysstof: ${raw.slice(0, 120)}`);
 }
 
-/** capture_thought through /mcp, as `actor` (the gate records it as who learned the line). */
-export function mcpCapture(mcpUrl: string, key: string, deps: HttpDeps = {}): (actor: string, args: Record<string, unknown>) => Promise<McpAnswer> {
-  return async (actor, args) => {
-    const text = await send(deps, "grysstof /mcp", mcpUrl, {
+/** One /mcp tool, as `actor` (the gate records it as who learned the line). */
+export function mcpTool(mcpUrl: string, key: string, deps: HttpDeps = {}): (actor: string, name: string, args: Record<string, unknown>) => Promise<McpAnswer> {
+  return async (actor, name, args) => {
+    const text = await send(deps, `grysstof /mcp ${name}`, mcpUrl, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "x-brain-key": key, "x-brain-actor": actor },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "capture_thought", arguments: args } }),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
     });
     return mcpText(text);
   };
 }
 
-/** GET /browse/api/loops next to /mcp (behind any path prefix GRYSSTOF_URL has), parsed. */
-export function browseLoops(mcpUrl: string, key: string, deps: HttpDeps = {}): (query: Record<string, string>) => Promise<unknown> {
+/** capture_thought through /mcp, as `actor`. */
+export function mcpCapture(mcpUrl: string, key: string, deps: HttpDeps = {}): (actor: string, args: Record<string, unknown>) => Promise<McpAnswer> {
+  const call = mcpTool(mcpUrl, key, deps);
+  return (actor, args) => call(actor, "capture_thought", args);
+}
+
+/** A GET under /browse/api next to /mcp (behind any path prefix GRYSSTOF_URL has), parsed. */
+function browseGet(mcpUrl: string, key: string, deps: HttpDeps, path: string, query: Record<string, string>): Promise<unknown> {
   const base = mcpUrl.replace(/\/mcp\/?$/, "");
-  return async (query) => {
-    const text = await send(deps, "grysstof /browse/api/loops", `${base}/browse/api/loops?${new URLSearchParams(query)}`, {
-      method: "GET",
-      headers: { accept: "application/json", "x-brain-key": key },
-    });
-    return JSON.parse(text);
-  };
+  return send(deps, `grysstof /browse/api${path}`, `${base}/browse/api${path}?${new URLSearchParams(query)}`, {
+    method: "GET",
+    headers: { accept: "application/json", "x-brain-key": key },
+  }).then((text) => JSON.parse(text));
+}
+
+/** GET /browse/api/loops (C3). */
+export function browseLoops(mcpUrl: string, key: string, deps: HttpDeps = {}): (query: Record<string, string>) => Promise<unknown> {
+  return (query) => browseGet(mcpUrl, key, deps, "/loops", query);
+}
+
+/** GET /browse/api/history: every line of one subject, superseded ones included. */
+export function browseHistory(mcpUrl: string, key: string, deps: HttpDeps = {}): (subject: string) => Promise<unknown> {
+  return (subject) => browseGet(mcpUrl, key, deps, "/history", { subject });
 }
