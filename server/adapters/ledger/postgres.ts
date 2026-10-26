@@ -74,7 +74,7 @@ export class PostgresLedger implements Ledger {
           [scope.tenant, subject, claim, source, proof, JSON.stringify(tags), scope.actor, learnedAt, older?.id ?? null, vectorLiteral(embedding), this.embedder.model, this.embedder.dimensions, occurredAtOf(a.occurredAt) ?? null],
         );
         const fact = toFact(r.rows[0]);
-        if (older) await c.queryArray(`UPDATE facts SET superseded_by = $1::uuid WHERE id = $2::uuid AND tenant = $3`, [fact.id, older.id, scope.tenant]);
+        if (older) await this.link(c, scope, fact.id, older.id);
         await c.queryArray("COMMIT");
         this.log.info("ledger.asserted", { ledger: "postgres", id: fact.id, subject, tenant: scope.tenant });
         return fact;
@@ -133,8 +133,8 @@ export class PostgresLedger implements Ledger {
           seen.add(cur.supersededBy);
           cur = await this.fact(c, scope, cur.supersededBy);
         }
-        await c.queryArray(`UPDATE facts SET superseded_by = $1::uuid WHERE id = $2::uuid AND tenant = $3`, [newer.id, older.id, scope.tenant]);
-        if (!newer.supersedes) await c.queryArray(`UPDATE facts SET supersedes = $1::uuid WHERE id = $2::uuid AND tenant = $3`, [older.id, newer.id, scope.tenant]);
+        await this.link(c, scope, newer.id, older.id);
+        if (!newer.supersedes) await c.queryArray(`UPDATE facts SET supersedes = $1::uuid WHERE id = $2::uuid AND tenant = $3 AND supersedes IS NULL`, [older.id, newer.id, scope.tenant]);
         await c.queryArray("COMMIT");
         return (await this.fact(c, scope, newer.id))!;
       } catch (e) {
@@ -174,21 +174,36 @@ export class PostgresLedger implements Ledger {
     });
   }
 
-  private async fact(c: Parameters<Parameters<PostgresMemory["run"]>[0]>[0], scope: Scope, id: string): Promise<Fact | null> {
+  /** `lock`: SELECT … FOR UPDATE, so a second transaction about to link the same older line waits for this one and then sees its link. */
+  private async fact(c: Parameters<Parameters<PostgresMemory["run"]>[0]>[0], scope: Scope, id: string, lock = false): Promise<Fact | null> {
     if (!isUuid(id)) return null;
-    const r = await c.queryObject<Row>(`SELECT ${COLS} FROM facts WHERE tenant = $1 AND id = $2::uuid`, [scope.tenant, id]);
+    const r = await c.queryObject<Row>(`SELECT ${COLS} FROM facts WHERE tenant = $1 AND id = $2::uuid${lock ? " FOR UPDATE" : ""}`, [scope.tenant, id]);
     return r.rows[0] ? toFact(r.rows[0]) : null;
   }
 
   /** A line of this tenant, or an Error that does not say whether it exists elsewhere. */
-  private async owned(c: Parameters<Parameters<PostgresMemory["run"]>[0]>[0], scope: Scope, id: string): Promise<Fact> {
-    const f = await this.fact(c, scope, id);
+  private async owned(c: Parameters<Parameters<PostgresMemory["run"]>[0]>[0], scope: Scope, id: string, lock = false): Promise<Fact> {
+    const f = await this.fact(c, scope, id, lock);
     if (!f) throw new Error(`No fact ${id}`);
     return f;
   }
 
+  /**
+   * Marks `olderId` superseded by `newerId`, only if nothing has superseded it yet. The row lock
+   * taken in `linkable` makes a racing writer wait; the guard and the row count are the second
+   * line of defence, so two writers can never both win and fork the history.
+   */
+  private async link(c: Parameters<Parameters<PostgresMemory["run"]>[0]>[0], scope: Scope, newerId: string, olderId: string): Promise<void> {
+    const r = await c.queryArray(`UPDATE facts SET superseded_by = $1::uuid WHERE id = $2::uuid AND tenant = $3 AND superseded_by IS NULL`, [newerId, olderId, scope.tenant]);
+    if (r.rowCount !== 1) {
+      this.log.warn("ledger.supersede_lost_race", { ledger: "postgres", newer: newerId, older: olderId, tenant: scope.tenant, rows: r.rowCount ?? null });
+      throw new Error(`Fact ${olderId} is already superseded`);
+    }
+  }
+
+  /** The older line, locked for the rest of the transaction, or an Error saying why it cannot be superseded. */
   private async linkable(c: Parameters<Parameters<PostgresMemory["run"]>[0]>[0], scope: Scope, olderId: string, subject: string): Promise<Fact> {
-    const older = await this.owned(c, scope, olderId);
+    const older = await this.owned(c, scope, olderId, true);
     if (older.subject !== subject) throw new Error(`Fact ${olderId} is about "${older.subject}", not "${subject}"; a fact only supersedes one about the same subject`);
     if (older.supersededBy) throw new Error(`Fact ${olderId} is already superseded by ${older.supersededBy}`);
     return older;
