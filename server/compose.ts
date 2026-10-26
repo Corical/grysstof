@@ -193,12 +193,12 @@ export async function compose(s: Settings, log: Log): Promise<{ ports: Ports; op
     }
     case "sqlite": {
       const { SqliteLedger } = await import("./adapters/ledger/sqlite.ts");
-      ledger = new SqliteLedger(s.get("OB_LEDGER_FILE") ?? s.require("OB_SQLITE_FILE"), undefined, await embedder());
+      ledger = new SqliteLedger(s.get("OB_LEDGER_FILE") ?? s.require("OB_SQLITE_FILE"), undefined, await embedder(), { log });
       break;
     }
     case "jsonl": {
       const { JsonlLedger } = await import("./adapters/ledger/in-process.ts");
-      ledger = new JsonlLedger(s.get("OB_LEDGER_FILE") ?? `${s.require("OB_MEMORY_DIR")}/ledger.jsonl`);
+      ledger = new JsonlLedger(s.get("OB_LEDGER_FILE") ?? `${s.require("OB_MEMORY_DIR")}/ledger.jsonl`, undefined, { log });
       break;
     }
     default: {

@@ -7,7 +7,8 @@
  * Every mutation is an Event. `apply` is the only thing that changes state,
  * so a subclass that persists the events (JsonlLedger) gets replay for free.
  */
-import type { Assertion, Fact, FindOptions, Found, Ledger, Scope, SubjectSummary } from "../../core/ports/mod.ts";
+import type { Assertion, Fact, FindOptions, Found, Ledger, Log, Scope, SubjectSummary } from "../../core/ports/mod.ts";
+import { NullLog } from "../log.ts";
 
 import { cosine, type Embedder } from "../memory/vectors.ts";
 
@@ -26,6 +27,18 @@ export type Event =
   | { kind: "assert"; fact: Fact }
   | { kind: "confirm"; tenant: string; id: string; by: string; at: string }
   | { kind: "supersede"; tenant: string; newer: string; older: string };
+
+/** Logs one failed persist as `ledger.write_failed`, with what the event was about. Never throws. */
+export function writeFailed(log: Log, ledger: string, event: Event, err: unknown): void {
+  const about = event.kind === "assert"
+    ? { tenant: event.fact.tenant, subject: event.fact.subject, id: event.fact.id }
+    : event.kind === "confirm" ? { tenant: event.tenant, id: event.id } : { tenant: event.tenant, newer: event.newer, older: event.older };
+  try {
+    log.error("ledger.write_failed", { ledger, kind: event.kind, ...about }, err);
+  } catch {
+    // a log never stops the ledger
+  }
+}
 
 const clean = (s: unknown) => (typeof s === "string" ? s.trim() : "");
 const must = (value: string, name: string) => {
@@ -253,9 +266,11 @@ export class InProcessLedger implements Ledger {
  */
 export class JsonlLedger extends InProcessLedger {
   private chain: Promise<void> = Promise.resolve();
+  private readonly log: Log;
 
-  constructor(private readonly file: string, now?: () => Date) {
+  constructor(private readonly file: string, now?: () => Date, opts: { log?: Log } = {}) {
     super(now);
+    this.log = opts.log ?? new NullLog();
     try {
       const text = Deno.readTextFileSync(file);
       this.replay(text.split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Event));
@@ -264,12 +279,17 @@ export class JsonlLedger extends InProcessLedger {
     }
   }
 
+  /**
+   * Appends, then applies. A failed append fails only its own write: the chain moves on, so the
+   * next write is attempted afresh once the cause is gone (row 10), and the failure is logged.
+   */
   protected override record(event: Event): Promise<void> {
     const line = JSON.stringify(event) + "\n";
-    this.chain = this.chain.then(async () => {
+    const run = this.chain.then(async () => {
       await Deno.writeTextFile(this.file, line, { append: true });
       this.apply(event);
     });
-    return this.chain;
+    this.chain = run.catch((err) => writeFailed(this.log, "jsonl", event, err));
+    return run;
   }
 }
