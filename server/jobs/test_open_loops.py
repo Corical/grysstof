@@ -13,6 +13,7 @@ import io
 import json
 import os
 import socket
+import sys
 import tempfile
 import time
 import unittest
@@ -921,6 +922,30 @@ class Run(JobCase):
                 self.assertIn("model pass failed; list may be stale", text)
                 self.assertIn("6498 export fails on large sites", text, "the recorded open loops are still listed")
                 self.assertNotIn("Quarterly review pack", text)
+
+    def test_a_console_that_is_not_utf8_still_gets_the_failure_out(self):
+        for post in (False, True):
+            with self.subTest(post=post):
+                net = fixture_net()
+                net.model = ("http", 401)
+                out_raw, err_raw = io.BytesIO(), io.BytesIO()
+                out = io.TextIOWrapper(out_raw, encoding="cp1252", errors="strict")
+                err = io.TextIOWrapper(err_raw, encoding="cp1252", errors="strict")
+                argv = ["--env", str(self.env_path)] + (["--post"] if post else [])
+                with mock.patch("urllib.request.urlopen", net), mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+                    code = ol.main(argv)  # must not raise UnicodeEncodeError
+                out.flush()
+                err.flush()
+                printed = out_raw.getvalue().decode("cp1252") + err_raw.getvalue().decode("cp1252")
+                self.assertEqual(net.unexpected, [])
+                self.assertNotEqual(code, 0)
+                self.assertIn("model.failed", printed)
+                self.assertNotIn("UnicodeEncodeError", printed)
+                if post:
+                    self.assertIn("⚠", self.posted(net), "Discord still gets the marks")
+                    self.assertIn("model pass failed; list may be stale", self.posted(net))
+                else:
+                    self.assertIn("model pass failed; list may be stale", printed)
 
     def test_model_failure_dry_run_posts_nothing(self):
         net = fixture_net()
