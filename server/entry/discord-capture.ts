@@ -9,7 +9,9 @@
  * GRYSSTOF_URL (default http://localhost:$PORT/mcp), DISCORD_WATERMARKS
  * (default %LOCALAPPDATA%/grysstof/discord-watermarks.json), DISCORD_BACKFILL_SINCE
  * (an ISO date; every readable text channel with no watermark yet is seeded to it,
- * so the next start imports history from that date; remove it once done).
+ * so the next start imports history from that date; remove it once done),
+ * DISCORD_CAPTURE_GUILDS (comma-separated guild ids; unset means every guild, as before;
+ * when set, messages, backfill and reactions of other guilds are skipped, each guild logged once).
  *
  * The loops assistant (writer/discord-pa.ts): PA_ENABLED (unset means off), PA_USERS
  * (comma-separated Discord user ids allowed to use /loops). When on, /loops and /loops-help are
@@ -23,7 +25,7 @@
  */
 import { advance, type Capture, type DiscordMessage, distil, type Names, type Reaction, type Watermarks } from "../writer/discord.ts";
 import { type ReactionIo, syncChannelReactions, syncMessageReactions } from "../writer/discord-reactions.ts";
-import { type Interaction, onInteraction, type PaIo, paConfig, registerCommands } from "../writer/discord-pa.ts";
+import { guildAllowed, type Interaction, makeGuildFilter, onInteraction, type PaIo, paConfig, parseIdList, registerCommands } from "../writer/discord-pa.ts";
 import { browseLoops, discordClient, type HttpDeps, mcpCapture } from "../writer/discord-rest.ts";
 
 const API = "https://discord.com/api/v10";
@@ -54,7 +56,9 @@ async function log(fields: Record<string, unknown>) {
   } catch { /* the log is a courtesy */ }
 }
 
-// --- the loops assistant ---
+// --- which guilds are captured, and the loops assistant ---
+const captureGuilds = parseIdList(Deno.env.get("DISCORD_CAPTURE_GUILDS"));
+const captureGuild = makeGuildFilter(captureGuilds, (guild) => void log({ event: "capture.guild_skipped", guild, hint: "not in DISCORD_CAPTURE_GUILDS" }));
 const pa = paConfig(Deno.env.get("PA_ENABLED"), Deno.env.get("PA_USERS"));
 const paRest: HttpDeps = { onRateLimit: (f) => void log({ event: "discord.rate_limited", ...f }) };
 const paIo: PaIo = {
@@ -113,6 +117,18 @@ async function namesFor(m: DiscordMessage): Promise<Names> {
   const parent = THREAD_TYPES.has(c.type) && c.parent ? channels.get(c.parent)?.name : undefined;
   const parentId = THREAD_TYPES.has(c.type) ? c.parent : undefined; // a plain channel's parent is its category, not a conversation
   return { guild: m.guild_id ? guilds.get(m.guild_id) : undefined, channel: c.name, parent, parentId, channelNames: (id) => channels.get(id)?.name };
+}
+
+/** The guild a channel belongs to: the cache, else (only when the allowlist needs to know) one REST lookup. */
+async function guildOf(channelId: string): Promise<string | undefined> {
+  if (captureGuilds && !channels.get(channelId)?.guild) {
+    try {
+      remember(await rest<{ id: string; name?: string; type: number; parent_id?: string | null; guild_id?: string }>(`/channels/${channelId}`));
+    } catch (e) {
+      await log({ event: "channel.lookup_failed", channel: channelId, error: String(e) });
+    }
+  }
+  return channels.get(channelId)?.guild;
 }
 
 // --- watermarks ---
@@ -206,7 +222,9 @@ function reactionChanged(d: { guild_id?: string; channel_id: string; message_id:
 async function reactionCatchUp() {
   const since = snowflakeAt(new Date(Date.now() - REACTION_CATCHUP_DAYS * 86_400_000).toISOString());
   for (const channelId of Object.keys(marks)) {
-    const guild = channels.get(channelId)?.guild ?? "@me";
+    const owner = await guildOf(channelId);
+    if (!captureGuild(owner)) continue;
+    const guild = owner ?? "@me";
     try {
       const done = await syncChannelReactions(reactionIo, guild, channelId, since);
       if (done.withReactions) await log({ event: "reactions.caught_up", channel: channelId, ...done });
@@ -221,6 +239,7 @@ function enqueue(raw: DiscordMessage, via: "gateway" | "backfill") {
   chain = chain.then(async () => {
     const names = await namesFor(raw);
     const m = withGuild(raw);
+    if (!captureGuild(m.guild_id)) return;
     const d = distil(m, names);
     if ("skip" in d) {
       await log({ event: "message.skipped", via, id: m.id, channel: m.channel_id, reason: d.skip });
@@ -245,6 +264,7 @@ async function backfill() {
     const seed = snowflakeAt(since);
     let seeded = 0;
     for (const g of await rest<{ id: string }[]>("/users/@me/guilds")) {
+      if (!captureGuild(g.id)) continue;
       const chans = await rest<{ id: string; name?: string; type: number; parent_id?: string | null }[]>(`/guilds/${g.id}/channels`);
       for (const c of chans) {
         remember(c, g.id);
@@ -257,6 +277,7 @@ async function backfill() {
     await log({ event: "backfill.seeded", since, channels: seeded });
   }
   for (const [channelId, after] of Object.entries(marks)) {
+    if (!captureGuild(await guildOf(channelId))) continue;
     let cursor = after;
     for (;;) {
       let page: DiscordMessage[];
@@ -349,13 +370,14 @@ async function dispatch(t: string, d: unknown) {
         bot: r.user.username,
         brain: brainUrl,
         watermarks: Object.keys(marks).length,
+        captureGuilds: captureGuilds ? [...captureGuilds] : "all",
         pa: pa.enabled ? `on, ${pa.users.size} user(s)` : "off",
       });
       backfill().then(reactionCatchUp);
       if (pa.enabled && !commandsRegistered) {
         // Beside the backfill, never awaited, never rejecting; a failure is retried at the next READY.
         commandsRegistered = true;
-        const ids = (r.guilds ?? []).map((g) => g.id);
+        const ids = (r.guilds ?? []).map((g) => g.id).filter((id) => guildAllowed(captureGuilds, id));
         registerCommands(paIo, r.application?.id ?? "", ids).then((ok) => {
           if (!ok) commandsRegistered = false;
         });
@@ -384,9 +406,11 @@ async function dispatch(t: string, d: unknown) {
     case "MESSAGE_REACTION_ADD":
     case "MESSAGE_REACTION_REMOVE":
     case "MESSAGE_REACTION_REMOVE_ALL":
-    case "MESSAGE_REACTION_REMOVE_EMOJI":
-      reactionChanged(d as { guild_id?: string; channel_id: string; message_id: string });
+    case "MESSAGE_REACTION_REMOVE_EMOJI": {
+      const r = d as { guild_id?: string; channel_id: string; message_id: string };
+      if (captureGuild(r.guild_id)) reactionChanged(r);
       break;
+    }
     case "INTERACTION_CREATE":
       // Not awaited and never rejecting: a command must not wait behind a capture, and nothing the
       // PA does can throw out of this handler and end the process.
