@@ -12,9 +12,13 @@ Python 3.11 or later, standard library only.
 | Command | What it does |
 |---|---|
 | `open_loops.py --env FILE --check` | Reads Grysstof, says which settings are set (never their values), compares the clock with Discord's `Date` header (fails above 60 seconds). No model, no writes, no post. |
-| `open_loops.py --env FILE` | Dry run: the model pass, then prints `would open N, close M, update K`, every line it would write, and the post. Writes nothing, posts nothing. |
+| `open_loops.py --env FILE` | Dry run: the model pass, then prints `would unpark N`, `would open N, close M, update K`, every line it would write, and the post. Writes nothing, posts nothing. |
 | `open_loops.py --env FILE --post` | Writes the ledger lines, then posts to the webhook. |
 | `--lock FILE` | Holds this lock for the run. A held lock exits at once; one older than an hour also posts "previous run still holding the lock" (with `--post`). |
+
+A parked loop whose `until` has passed (a bare date counts from 00:00 SAST that day) comes back at the start of
+the run: one `OPEN/1` line superseding the `PARKED/1` line, every field carried from the OPEN line before it, read
+from `/browse/api/history`. It then takes part in the run like any open loop.
 
 Exit codes: 0 done; 1 a failure (one line on stderr, and in the channel with `--post`); 2 settings; 3 lock held.
 
