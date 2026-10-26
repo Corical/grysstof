@@ -13,7 +13,7 @@
  *  - `onInteraction` and `registerCommands` never reject: the capture bot must not die of the PA.
  *  - Every failure is one log line with an event name; nothing pings anyone (`parse: []`).
  */
-import { compose, LIMITS, LOOP_STATES, type LoopState, type LoopType, type LoopView, sanitise } from "../core/loops.ts";
+import { compose, KEY_RE, LIMITS, LOOP_STATES, type LoopState, type LoopType, type LoopView, sanitise } from "../core/loops.ts";
 import { HttpError, type McpAnswer, TimeoutError } from "./discord-rest.ts";
 
 export const PAGE_SIZE = 6;
@@ -217,8 +217,8 @@ async function findLoop(io: PaIo, key: string): Promise<Loop | undefined> {
 
 // ---------- custom_id ----------
 
-/** The key grammar of the v3.1 addendum. TODO: import KEY_RE from core/loops.ts once lane A exports it. */
-export const KEY_RE = /^\d{17,20}(:[a-z])?(:\d{1,3})?$/;
+/** The key grammar is owned by core/loops.ts; re-exported here for the tests. */
+export { KEY_RE };
 const CLIENT_RE = /^[a-z0-9][a-z0-9._-]{0,39}$/;
 type Act = "R" | "P" | "U" | "O";
 /** Which loop states each action is offered on: Resolve on open and parked, Park on open, Unpark on parked, Reopen on closed and resolved. */
