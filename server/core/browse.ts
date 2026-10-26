@@ -112,9 +112,12 @@ const ROUTES = new Map<string, Route>(Object.entries({
     return { ...summariseConversation(conv, clientForChannel(conv.channel, p.clients, p.overrides).client), messages: conv.messages, graph };
   },
   // Plan 5, C3: every loop the bot believes in, by state; consumed by the open-loops job and the PA in Discord.
+  // With key=, exactly that loop (one subject read, for a press's re-read); offset= pages (v3.1 addendum).
   "/loops": async (q, ports, scope) => {
-    const query = loopQuery({ state: param(q, "state"), since: param(q, "since"), client: param(q, "client"), limit: limitOf(q, 200, 2000) });
-    const read = await readLoops(ports, scope);
+    const query = loopQuery({
+      state: param(q, "state"), since: param(q, "since"), client: param(q, "client"), key: param(q, "key"), offset: param(q, "offset"), limit: limitOf(q, 200, 2000),
+    });
+    const read = await readLoops(ports, scope, query.key);
     const { loops, total } = selectLoops(read.loops, query, new Date());
     return { loops, unreadable: read.unreadable, warnings: { understandFailed: read.understandFailed }, total };
   },
@@ -144,28 +147,51 @@ async function pulseInputs(ports: Ports, scope: Scope) {
 }
 
 /**
- * Every loop subject of the tenant read into a loop, in subject order. A loop that cannot be read
- * is listed under `unreadable` and logged, never dropped; a fork is logged. `understandFailed`
- * counts current lines written without tags, i.e. while Understanding was down.
+ * Loop warnings already logged in detail, per ledger, so a stale fork or a bad line is logged once
+ * when first seen, not again on every page press (row 29). Keyed weakly by the ledger instance:
+ * one server process, one set; a new ledger (a test, a restart) starts afresh.
  */
-async function readLoops(ports: Ports, scope: Scope) {
-  const subjects = (await ports.ledger.subjects(scope)).map((s) => s.subject).filter((s) => s.startsWith(LOOP_PREFIX)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+const loggedOnce = new WeakMap<object, Set<string>>();
+function firstTime(ledger: object, what: string, tenant: string, lineId: string): boolean {
+  let seen = loggedOnce.get(ledger);
+  if (!seen) loggedOnce.set(ledger, seen = new Set());
+  const k = JSON.stringify([what, tenant, lineId]);
+  if (seen.has(k)) return false;
+  seen.add(k);
+  return true;
+}
+
+/**
+ * The tenant's loop subjects read into loops, in subject order (or just `loop:<key>`). A loop that
+ * cannot be read is listed under `unreadable`, never dropped. Each unreadable line and each fork is
+ * logged in detail once; every call with anything to warn about logs one `loops.warnings` count.
+ * `understandFailed` counts current lines written without tags, i.e. while Understanding was down.
+ */
+async function readLoops(ports: Ports, scope: Scope, key?: string) {
+  const subjects = key !== undefined
+    ? [`${LOOP_PREFIX}${key}`]
+    : (await ports.ledger.subjects(scope)).map((s) => s.subject).filter((s) => s.startsWith(LOOP_PREFIX)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  const who = { tenant: scope.tenant, actor: scope.actor };
   const loops: LoopView[] = [];
   const unreadable: { subject: string; lineId: string }[] = [];
-  let understandFailed = 0;
+  let understandFailed = 0, forks = 0;
   for (const subject of subjects) {
     const history = await ports.ledger.history(scope, subject);
+    if (!history.length) continue; // a key nobody has written
     const heads = history.filter((f) => !f.supersededBy);
     understandFailed += heads.filter((f) => f.tags.length === 0).length;
     const r = readLoop(subject, history);
     if (r.ok) {
       loops.push(r.loop);
-      if (r.loop.fork) ports.log.warn("loops.fork", { subject, lineId: r.loop.lineId, heads: heads.map((f) => f.id), tenant: scope.tenant, actor: scope.actor });
+      if (!r.loop.fork) continue;
+      forks++;
+      if (firstTime(ports.ledger, "fork", scope.tenant, r.loop.lineId)) ports.log.warn("loops.fork", { subject, lineId: r.loop.lineId, heads: heads.map((f) => f.id), ...who });
     } else {
       unreadable.push({ subject, lineId: r.unreadable.lineId });
-      ports.log.warn("loops.unreadable", { subject, lineId: r.unreadable.lineId, reason: r.unreadable.reason, tenant: scope.tenant, actor: scope.actor });
+      if (firstTime(ports.ledger, "unreadable", scope.tenant, r.unreadable.lineId)) ports.log.warn("loops.unreadable", { subject, lineId: r.unreadable.lineId, reason: r.unreadable.reason, ...who });
     }
   }
+  if (unreadable.length || forks || understandFailed) ports.log.warn("loops.warnings", { unreadable: unreadable.length, forks, understandFailed, ...(key !== undefined ? { key } : {}), ...who });
   return { loops, unreadable, understandFailed };
 }
 
