@@ -38,7 +38,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -82,7 +82,9 @@ BASE_SETTINGS = ("GRYSSTOF_URL", "MCP_ACCESS_KEY", "XACTCO_MEMBERS")
 SOURCE_RE = re.compile(r"^discord:([^/]+)/(\d+)/(\d+)$")
 PROOF_RE = re.compile(r"^https://discord\.com/channels/([^/]+)/(\d+)/(\d+)$")
 AUTHOR_RE = re.compile(r", \d{4}-\d{2}-\d{2}, ([^:\n]+?): ")
-KEY_RE = re.compile(r"^(\d{17,20})(?::([a-z]))?(?::(\d{1,3}))?$")  # the key grammar of plan v3.1 (core/loops.ts KEY_RE)
+# The key grammar of plan v3.1 (core/loops.ts KEY_RE), always used with fullmatch: ASCII digits only (Python's \d
+# matches other scripts' digits, JavaScript's does not) and nothing after the last part (Python's $ allows a newline).
+KEY_RE = re.compile(r"([0-9]{17,20})(?::([a-z]))?(?::([0-9]{1,3}))?")
 LETTERS = [""] + [chr(c) for c in range(ord("b"), ord("z") + 1)]
 DISCORD_EPOCH_MS = 1420070400000
 
@@ -203,8 +205,21 @@ UNSAFE_RE = re.compile("[\x00-\x1f\x7f-\x9f\ud800-\udfff\u2028\u2029\u200e\u200f
 JS_SPACE = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 SPACE_RE = re.compile(f"[{JS_SPACE}]+")
 ID_DROP_RE = re.compile(f"[|,{JS_SPACE}]")
-TEXT_CAPS = {"title": 120, "summary": 300, "note": 300, "reason": 200, "owner": NAME_CAP, "channel": NAME_CAP, "by_name": NAME_CAP}
-ID_FIELDS = {"key", "client", "type", "channel_id", "opened", "closed", "resolved", "until", "by_user", "by_message"}
+# JavaScript's String.prototype.trim() set, as code points (the same characters as JS_SPACE).
+JS_TRIM = "".join(chr(c) for c in (*range(0x09, 0x0E), 0x20, 0xA0, 0x1680, *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F,
+                                   0x205F, 0x3000, 0xFEFF))
+C1_FIELDS = {
+    "OPEN": ("key", "client", "type", "owner", "channel", "channel_id", "opened", "reopened", "title", "summary", "evidence"),
+    "CLOSED": ("key", "by_message", "closed", "reason"),
+    "RESOLVED": ("key", "by_user", "by_name", "resolved", "note"),
+    "PARKED": ("key", "by_user", "by_name", "until", "note"),
+}
+TAG_RE = re.compile(r"(OPEN|CLOSED|RESOLVED|PARKED)/([0-9]+)")
+DAY_RE = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})")
+
+
+class C1Refused(JobError):
+    """compose() refusing a line that parse() could not read back; the message names the field."""
 
 
 def sanitise(text, limit=None) -> str:
@@ -237,64 +252,111 @@ def evidence_list(ids) -> list:
     return clean_evidence(sorted((d for d in digits if d.isdigit()), key=int))
 
 
-def c1_field(name: str, value):
-    """One C1 field as core/loops.ts writes it, for the shared fixture (plan v3.1 row 18)."""
-    if name in TEXT_CAPS:
-        return sanitise(value, TEXT_CAPS[name])
-    if name == "reopened":
-        c = clean_id(value)
-        return "-" if c in ("", "-") else c
-    if name in ID_FIELDS:
-        return clean_id(value)
-    if name == "evidence":
-        return clean_evidence(value)
-    raise KeyError(f"no C1 field {name!r}")
+def reopened_of(v):
+    """core/loops.ts reopenedOf(): None when blank or '-' after cleaning."""
+    c = "" if v is None else clean_id(v)
+    return None if c in ("", "-") else c
 
 
-def compose(tag: str, pairs) -> str:
-    return " | ".join([tag] + [f"{k}={v}" for k, v in pairs])
+def c1_sanitise(tag: str, w: dict) -> dict:
+    """core/loops.ts sanitiseLine(), on the line's own (snake_case) field names: what parse(compose(w)) gives back."""
+    if tag == "OPEN":
+        return {"key": clean_id(w.get("key")), "client": clean_id(w.get("client")), "type": clean_id(w.get("type")),
+                "owner": sanitise(w.get("owner"), NAME_CAP), "channel": sanitise(w.get("channel"), NAME_CAP),
+                "channel_id": clean_id(w.get("channel_id")), "opened": clean_id(w.get("opened")),
+                "reopened": reopened_of(w.get("reopened")), "title": sanitise(w.get("title"), 120),
+                "summary": sanitise(w.get("summary"), 300), "evidence": clean_evidence(w.get("evidence"))}
+    if tag == "CLOSED":
+        return {"key": clean_id(w.get("key")), "by_message": clean_id(w.get("by_message")), "closed": clean_id(w.get("closed")),
+                "reason": sanitise(w.get("reason"), 200)}
+    if tag in ("RESOLVED", "PARKED"):
+        when = "resolved" if tag == "RESOLVED" else "until"
+        return {"key": clean_id(w.get("key")), "by_user": clean_id(w.get("by_user")), "by_name": sanitise(w.get("by_name"), NAME_CAP),
+                when: clean_id(w.get(when)), "note": sanitise(w.get("note"), 300)}
+    raise C1Refused(f"unknown loop line tag {tag!r}")
+
+
+def is_instant(v) -> bool:
+    """core/loops.ts isInstant(): ISO 8601 beginning YYYY-MM-DD, a calendar date that exists, a time that parses."""
+    if not isinstance(v, str):
+        return False
+    m = DAY_RE.match(v)
+    if not m or (len(v) > 10 and v[10] not in "T "):  # Python takes any character between date and time; Date.parse does not
+        return False
+    try:
+        date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        datetime.fromisoformat(v[:-1] + "+00:00" if v.endswith("Z") else v)
+    except ValueError:
+        return False
+    return True
+
+
+def c1_invalid(tag: str, f: dict):
+    """core/loops.ts invalid(): why these written fields make no readable line of this tag, or None."""
+    if not f["key"]:
+        return "key is blank"
+    if not KEY_RE.fullmatch(f["key"]):
+        return f'key "{f["key"][:40]}" does not match the key grammar'
+
+    def when(name):
+        return None if is_instant(f[name]) else f'{name} is not an ISO 8601 time: "{f[name][:40]}"'
+
+    if tag == "OPEN":
+        if f["type"] not in TYPES:
+            return f'type "{f["type"][:40]}" is not one of {", ".join(TYPES)}'
+        if f["reopened"] not in ("", "-") and not is_instant(f["reopened"]):
+            return when("reopened")
+        return when("opened")
+    if tag == "CLOSED":
+        return when("closed") if f["by_message"] else "by_message is blank"
+    if tag == "RESOLVED":
+        return when("resolved") if f["by_user"] else "by_user is blank"
+    return when("until") if f["by_user"] else "by_user is blank"
+
+
+def c1_compose(tag: str, w: dict) -> str:
+    """core/loops.ts compose(): sanitise every field, refuse a line parse() could not read back, write it."""
+    f = c1_sanitise(tag, w)
+    if tag == "OPEN":
+        f = {**f, "reopened": f["reopened"] or "-", "evidence": ",".join(f["evidence"])}
+    problem = c1_invalid(tag, f)
+    if problem:
+        raise C1Refused(f"cannot compose a {tag} line: {problem}")
+    return " | ".join([f"{tag}/1"] + [f"{name}={f[name]}" for name in C1_FIELDS[tag]])
+
+
+def c1_parse(claim):
+    """core/loops.ts parse(): (tag, fields as the fixture writes them), or None for a claim nobody can read.
+    Strict about tag, version, which fields, the key grammar, types and times; tolerant of spacing and field order."""
+    if not isinstance(claim, str) or "\r" in claim or "\n" in claim:
+        return None
+    parts = [p.strip(JS_TRIM) for p in claim.split("|")]
+    m = TAG_RE.fullmatch(parts[0])
+    if not m or m.group(2) != "1":
+        return None
+    tag, f = m.group(1), {}
+    for p in parts[1:]:
+        eq = p.find("=")
+        if eq <= 0:
+            return None
+        name = p[:eq].strip(JS_TRIM)
+        if name not in C1_FIELDS[tag] or name in f:
+            return None
+        f[name] = p[eq + 1:].strip(JS_TRIM)
+    if any(name not in f for name in C1_FIELDS[tag]) or c1_invalid(tag, f):
+        return None
+    if tag == "OPEN":
+        f["reopened"] = reopened_of(f["reopened"])
+        f["evidence"] = [e for e in (x.strip(JS_TRIM) for x in f["evidence"].split(",")) if e]
+    return tag, f
 
 
 def open_line(f: dict) -> str:
-    return compose("OPEN/1", [
-        ("key", clean_id(f["key"])),
-        ("client", clean_id(f.get("client"))),
-        ("type", clean_id(f.get("type"))),
-        ("owner", sanitise(f.get("owner"), NAME_CAP)),
-        ("channel", sanitise(f.get("channel"), NAME_CAP)),
-        ("channel_id", clean_id(f.get("channel_id"))),
-        ("opened", clean_id(f.get("opened"))),
-        ("reopened", c1_field("reopened", f.get("reopened"))),
-        ("title", sanitise(f.get("title"), 120)),
-        ("summary", sanitise(f.get("summary"), 300)),
-        ("evidence", ",".join(clean_evidence(list(f.get("evidence") or [])))),
-    ])
+    return c1_compose("OPEN", f)
 
 
 def closed_line(key, by_message, closed, reason) -> str:
-    return compose("CLOSED/1", [("key", clean_id(key)), ("by_message", clean_id(by_message)),
-                                ("closed", clean_id(closed)), ("reason", sanitise(reason, 200))])
-
-
-OPEN_FIELDS = ("key", "client", "type", "owner", "channel", "channel_id", "opened", "reopened", "title", "summary", "evidence")
-
-
-def read_line(claim):
-    """A C1 line read back: (tag, fields), or None when it is not one readable line."""
-    if not isinstance(claim, str) or "\n" in claim or "\r" in claim:
-        return None
-    parts = [p.strip() for p in claim.split("|")]
-    m = re.fullmatch(r"(OPEN|CLOSED|RESOLVED|PARKED)/1", parts[0])
-    if not m:
-        return None
-    fields = {}
-    for p in parts[1:]:
-        name, eq, value = p.partition("=")
-        name = name.strip()
-        if not eq or not name or name in fields:
-            return None
-        fields[name] = value.strip()
-    return m.group(1), fields
+    return c1_compose("CLOSED", {"key": key, "by_message": by_message, "closed": closed, "reason": reason})
 
 
 def esc(s) -> str:
@@ -688,7 +750,7 @@ def newest_first(loops: list) -> list:
 
 
 def split_key(key):
-    m = KEY_RE.match(str(key or ""))
+    m = KEY_RE.fullmatch(str(key or ""))
     return (m.group(1), m.group(2) or "", int(m.group(3) or 1)) if m else None
 
 
@@ -1085,11 +1147,19 @@ def classify(out, msgs: list, loops_reply: dict, members: Members, mapping: dict
             taken.add(letter)
             add_open(opener_id + (f":{letter}" if letter else ""), it, it["opener"]["ts"])
 
+    def add(build) -> None:
+        """One write, composed by C1; a line C1 refuses is counted and named, never written and never fatal."""
+        try:
+            plan.writes.append(build())
+        except C1Refused as e:
+            plan.counts["unwritable"] += 1
+            plan.notes.append(f"write.refused {one_line(e)[:200]}")
+
     for key in sorted(closes):
         lp, msg = by_key[key], closes[key]
         record = {**lp, "state": "closed", "closed": iso(msg["ts"]), "byMessage": msg["msg_id"]}
-        plan.writes.append(Write("close", key, closed_line(key, msg["msg_id"], iso(msg["ts"]), f"member reply in #{msg['channel']}"),
-                                 lp.get("lineId"), msg["source"], msg["link"], iso(msg["ts"]), record, closer=msg))
+        add(lambda: Write("close", key, closed_line(key, msg["msg_id"], iso(msg["ts"]), f"member reply in #{msg['channel']}"),
+                          lp.get("lineId"), msg["source"], msg["link"], iso(msg["ts"]), record, closer=msg))
     for key in sorted(changes):
         if key in closes:
             continue
@@ -1111,10 +1181,10 @@ def classify(out, msgs: list, loops_reply: dict, members: Members, mapping: dict
                   "reopened": lp.get("reopened"), "title": lp.get("title"), "summary": lp.get("summary"), "evidence": merged}
         at = max((m["ts"] for m in good + ch["touched"]), default=now)
         record = {**lp, "owner": fields["owner"], "evidence": merged}
-        plan.writes.append(Write("update", key, open_line(fields), lp.get("lineId"), opener_source(lp), str(lp.get("proof") or ""),
-                                 iso(at), record))
+        add(lambda: Write("update", key, open_line(fields), lp.get("lineId"), opener_source(lp), str(lp.get("proof") or ""),
+                          iso(at), record))
     for key in sorted(opens):
-        plan.writes.append(new_open(key, opens[key]["it"], opens[key]["opened"], mapping, known))
+        add(lambda: new_open(key, opens[key]["it"], opens[key]["opened"], mapping, known))
     return plan
 
 
@@ -1164,10 +1234,8 @@ def previous_open(facts: list, parked_id, key: str):
     by_id = {f.get("id"): f for f in facts if isinstance(f, dict)}
 
     def open_fields(f):
-        r = read_line(f.get("claim"))
-        if not r or r[0] != "OPEN" or any(n not in r[1] for n in OPEN_FIELDS) or r[1]["key"] != key:
-            return None
-        return r[1] if parse_time(r[1]["opened"]) and r[1]["type"] in TYPES else None
+        r = c1_parse(f.get("claim"))  # the strict C1 reader: an unreadable line is never carried forward
+        return r[1] if r and r[0] == "OPEN" and r[1]["key"] == key else None
 
     seen = {parked_id}
     cur = by_id.get((by_id.get(parked_id) or {}).get("supersedes"))
@@ -1190,9 +1258,9 @@ def unpark_write(g: Grysstof, lp: dict, now: datetime) -> Write:
     hit = previous_open(g.history(subject), lp.get("lineId"), str(lp["key"]))
     if not hit:
         raise JobError(f"no readable OPEN line in the history of {subject}")
-    fact, f = hit
-    reopened = None if f["reopened"] in ("", "-") else f["reopened"]
-    evidence = [e for e in f["evidence"].split(",") if e.strip()]
+    fact, f = hit  # f as c1_parse reads it: reopened is None or a time, evidence a list
+    reopened = f["reopened"]
+    evidence = list(f["evidence"])
     fields = {"key": lp["key"], "client": f["client"], "type": f["type"], "owner": f["owner"], "channel": f["channel"],
               "channel_id": f["channel_id"], "opened": f["opened"], "reopened": reopened, "title": f["title"],
               "summary": f["summary"], "evidence": evidence}

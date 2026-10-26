@@ -13,6 +13,7 @@ import email.utils
 import io
 import json
 import os
+import re
 import signal
 import socket
 import sys
@@ -499,7 +500,7 @@ class LineFormat(unittest.TestCase):
     ]
 
     def fields(self, title, owner="Kelli", summary="s", client="servest"):
-        return {"key": "123", "client": client, "type": "unanswered_question", "owner": owner, "channel": "servest",
+        return {"key": "1559838169497604096", "client": client, "type": "unanswered_question", "owner": owner, "channel": "servest",
                 "channel_id": SERVEST, "opened": "2026-10-26T08:00:00.000Z", "reopened": None, "title": title,
                 "summary": summary, "evidence": ["3", "5"]}
 
@@ -563,7 +564,7 @@ class LineFormat(unittest.TestCase):
         self.assertEqual(ol.evidence_list(["11", "2", "9", "4", "10", "1", "7", "3", "8", "5", "6", "x"]), ["4", "5", "6", "7", "8", "9", "10", "11"])
 
     def test_closed_line_caps_the_reason(self):
-        tag, f = parse_line(ol.closed_line("123", "456", "2026-10-26T08:00:00.000Z", "r|" * 300))
+        tag, f = parse_line(ol.closed_line("1559838169497604096", "456", "2026-10-26T08:00:00.000Z", "r|" * 300))
         self.assertEqual(tag, "CLOSED/1")
         self.assertEqual(list(f), ["key", "by_message", "closed", "reason"])
         self.assertLessEqual(len(f["reason"]), 200)
@@ -571,23 +572,57 @@ class LineFormat(unittest.TestCase):
 
 
 class C1Fixture(unittest.TestCase):
-    """Plan v3.1 row 18: one sanitiser truth in two languages. Lane A writes the fixture; this reads the same file.
-    Expected shape: {"cases": [{"field": <C1 field name>, "input": <value>, "expected": <string, or list for evidence>}]}
-    (a bare list of cases is accepted too)."""
+    """Plan v3.1 row 18: one C1 truth in two languages. core/loops.ts is the reference; its generator writes
+    server/tests/fixtures/c1-sanitise.json and tests/loops.test.ts runs it in Deno. This runs the same three sections
+    the same way: lines (sanitise, compose, parse, compose again), refused (compose refuses, naming the field),
+    unreadable (parse does not read them)."""
 
-    def test_the_job_sanitises_every_field_as_core_loops_does(self):
+    CAPS = {"title": 120, "summary": 300, "note": 300, "reason": 200, "owner": 100, "channel": 100, "by_name": 100}
+    # What must never survive into a line: controls, U+2028/9, the bidi embeddings and isolates (as loops.test.ts checks).
+    LEFTOVERS = re.compile("[" + "".join(map(chr, (*range(0x00, 0x20), 0x7F, 0x2028, 0x2029, *range(0x202A, 0x202F),
+                                                    *range(0x2066, 0x206A)))) + "]")
+
+    @classmethod
+    def setUpClass(cls):
         if not C1_FIXTURE.exists():
-            self.skipTest(f"{C1_FIXTURE} is not on this branch yet (lane A writes it, plan v3.1 row 18); re-run when it lands")
-        data = json.loads(C1_FIXTURE.read_text(encoding="utf-8"))
-        cases = data.get("cases") if isinstance(data, dict) else data
-        self.assertTrue(cases, "the fixture holds no cases")
-        for i, case in enumerate(cases):
-            with self.subTest(case=i, field=case.get("field")):
-                got = ol.c1_field(case["field"], case["input"])
-                want = case["expected"]
-                if isinstance(want, str) and isinstance(got, list):
-                    got = ",".join(got)
-                self.assertEqual(got, want)
+            raise unittest.SkipTest(f"{C1_FIXTURE} is not on this branch (core writes it, plan v3.1 row 18)")
+        cls.c1 = json.loads(C1_FIXTURE.read_text(encoding="utf-8"))
+
+    def test_lines_sanitise_compose_and_parse_exactly_as_the_fixture_says(self):
+        self.assertGreaterEqual(len(self.c1["lines"]), 8, "a fixture with a handful of cases is not a contract")
+        for c in self.c1["lines"]:
+            with self.subTest(c["name"]):
+                self.assertEqual(ol.c1_sanitise(c["tag"], c["input"]), c["expected"], "sanitised")
+                self.assertEqual(ol.c1_compose(c["tag"], c["input"]), c["line"], "composed")
+                self.assertEqual(ol.c1_parse(c["line"]), (c["tag"], c["expected"]), "parsed")
+                self.assertEqual(ol.c1_compose(c["tag"], c["expected"]), c["line"], "the expected fields compose to the same line")
+                for field, cap in self.CAPS.items():
+                    if isinstance(c["expected"].get(field), str):
+                        self.assertLessEqual(len(c["expected"][field]), cap, f"{field} over its cap")
+                self.assertIsNone(self.LEFTOVERS.search(c["line"]), "an invisible or control character survived")
+
+    def test_refused_inputs_are_refused_naming_the_field(self):
+        self.assertTrue(self.c1["refused"])
+        for c in self.c1["refused"]:
+            with self.subTest(c["name"]):
+                with self.assertRaises(ol.C1Refused) as cm:
+                    ol.c1_compose(c["tag"], c["input"])
+                self.assertIn(c["because"], str(cm.exception))
+
+    def test_unreadable_claims_are_not_read(self):
+        self.assertTrue(self.c1["unreadable"])
+        for c in self.c1["unreadable"]:
+            with self.subTest(c["name"]):
+                self.assertIsNone(ol.c1_parse(c["claim"]))
+
+    def test_the_jobs_own_line_writers_are_that_composer(self):
+        for c in self.c1["lines"]:
+            with self.subTest(c["name"]):
+                if c["tag"] == "OPEN":
+                    self.assertEqual(ol.open_line(c["input"]), c["line"])
+                elif c["tag"] == "CLOSED":
+                    i = c["input"]
+                    self.assertEqual(ol.closed_line(i["key"], i["by_message"], i["closed"], i["reason"]), c["line"])
 
 
 class McpDecode(unittest.TestCase):
@@ -1074,7 +1109,9 @@ class Run(JobCase):
         self.assertEqual(close["supersedes"], "fact_w1")
         self.assertTrue(close["content"].startswith("CLOSED/1 | key=" + W1))
         self.assertTrue(all(c.get("occurred_at") for c in net.captures))
-        loops_at = [i for i, c in enumerate(net.calls) if "/browse/api/loops" in c["url"]]
+        for c in net.captures:
+            self.assertIsNotNone(ol.c1_parse(c["content"]), f"the job wrote a line C1 cannot read: {c['content']}")
+        loops_at =[i for i, c in enumerate(net.calls) if "/browse/api/loops" in c["url"]]
         mcp_at = [i for i, c in enumerate(net.calls) if c["url"] == BASE + "/mcp"]
         self.assertGreaterEqual(len(loops_at), 2, "/loops is read again after the writes")
         self.assertGreater(loops_at[-1], mcp_at[-1])
