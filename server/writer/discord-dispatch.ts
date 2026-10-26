@@ -13,23 +13,39 @@
  *    GUILD_CREATE (or after 30 s), and a channel whose guild cannot be found is held and retried,
  *    never skipped: while it is held, its live messages are left to its backfill, so its watermark
  *    cannot move past what was said while the bot was down.
+ *  - Holding is for failures that pass (5xx, network, a rate limit the REST helper gave up on),
+ *    retried with delays doubling from 30 s to 10 minutes. A 403 or 404 (no permission, channel
+ *    gone) will not pass: the channel is logged once as backfill.forbidden, its watermark left as
+ *    it is, and not asked again until the next start.
  */
 import { advance, type Capture, type DiscordMessage, distil, type Names, type Watermarks } from "./discord.ts";
 import { type ReactionIo, syncChannelReactions, syncMessageReactions } from "./discord-reactions.ts";
 import { guildAllowed, type Interaction, makeGuildFilter, onInteraction, type PaConfig, type PaIo, registerCommands } from "./discord-pa.ts";
+import { HttpError } from "./discord-rest.ts";
 
 /** How long backfill waits for the guild list when an allowlist is set. */
 export const GUILD_WAIT_MS = 30_000;
 /** First wait before a held channel or a failed registration is tried again; it doubles each time. */
 export const RETRY_BASE_MS = 30_000;
-/** The longest wait between tries. */
+/** The longest wait between registration tries. */
 export const RETRY_MAX_MS = 3_600_000;
+/** The longest wait between backfill tries of a held channel. */
+export const HOLD_MAX_MS = 600_000;
 const THREAD_TYPES = new Set([10, 11, 12]);
 const BACKFILL_PAGE = 100;
+/** Statuses that another try will not change: no permission to read, or the channel is gone. */
+const PERMANENT = new Set([403, 404]);
 
-/** The wait before try number `attempt + 1`: 30 s, 1 min, 2 min, … never more than an hour. */
-export function backoffMs(attempt: number): number {
-  return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, Math.min(attempt, 30)));
+/** The wait before try number `attempt + 1`: 30 s, 1 min, 2 min, … never more than `maxMs`. */
+export function backoffMs(attempt: number, maxMs = RETRY_MAX_MS): number {
+  return Math.min(maxMs, RETRY_BASE_MS * 2 ** Math.max(0, Math.min(attempt, 30)));
+}
+
+/** The HTTP status a failed Discord call ended with: an HttpError's, or the "… -> 403" its message ends with. */
+function statusOf(e: unknown): number | undefined {
+  if (e instanceof HttpError) return e.status;
+  const m = / -> (\d{3})\b/.exec(e instanceof Error ? e.message : String(e));
+  return m ? Number(m[1]) : undefined;
 }
 
 /** A Discord snowflake for an instant: everything after it was posted after that instant. */
@@ -109,10 +125,14 @@ export function createBot(io: BotIo, cfg: BotConfig, initialMarks: Watermarks): 
     const c = channels.get(channelId);
     channels.set(channelId, c ? { ...c, guild } : { name: channelId, type: 0, guild, partial: true });
   }
+  /** The status of each channel's last failed lookup, so backfill can tell "gone" from "try again". */
+  const lookupFailed = new Map<string, number>();
   async function lookup(channelId: string) {
     try {
       remember(await io.rest<RestChannel>(`/channels/${channelId}`));
+      lookupFailed.delete(channelId);
     } catch (e) {
+      lookupFailed.set(channelId, statusOf(e) ?? 0);
       await say({ event: "channel.lookup_failed", channel: channelId, error: String(e) });
     }
   }
@@ -159,15 +179,30 @@ export function createBot(io: BotIo, cfg: BotConfig, initialMarks: Watermarks): 
   }
 
   // --- backfill, and channels held until it can run ---
-  const held = new Map<string, { attempt: number; timer: unknown }>();
+  const held = new Map<string, { timer: unknown }>();
+  /** Failed tries in a row per channel. Kept across a release, so the delay grows; cleared when a backfill gets through. */
+  const attempts = new Map<string, number>();
+  /** Channels that answered 403 or 404: not asked again until the next start. */
+  const forbidden = new Set<string>();
 
   function hold(channelId: string, why: Record<string, unknown>) {
     const before = held.get(channelId);
     if (before) io.timers.clear(before.timer);
-    const attempt = before ? before.attempt + 1 : 0;
-    const wait = backoffMs(attempt);
-    held.set(channelId, { attempt, timer: io.timers.set(() => void track(release(channelId)), wait) });
+    const attempt = (attempts.get(channelId) ?? -1) + 1;
+    attempts.set(channelId, attempt);
+    const wait = backoffMs(attempt, HOLD_MAX_MS);
+    held.set(channelId, { timer: io.timers.set(() => void track(release(channelId)), wait) });
     void say({ ...why, channel: channelId, attempt: attempt + 1, retryInMs: wait, hint: "held: its live messages wait for its backfill" });
+  }
+
+  function forbid(channelId: string, status: number) {
+    const before = held.get(channelId);
+    if (before) io.timers.clear(before.timer);
+    held.delete(channelId);
+    attempts.delete(channelId);
+    if (forbidden.has(channelId)) return;
+    forbidden.add(channelId);
+    void say({ event: "backfill.forbidden", channel: channelId, status, hint: "not asked again until the next start; its watermark is left as it is" });
   }
 
   async function release(channelId: string) {
@@ -176,7 +211,10 @@ export function createBot(io: BotIo, cfg: BotConfig, initialMarks: Watermarks): 
     io.timers.clear(h.timer);
     held.delete(channelId);
     await backfillChannel(channelId);
-    if (!held.has(channelId)) await say({ event: "backfill.released", channel: channelId });
+    if (!held.has(channelId)) {
+      attempts.delete(channelId);
+      if (!forbidden.has(channelId)) await say({ event: "backfill.released", channel: channelId });
+    }
     await chain;
   }
 
@@ -184,7 +222,10 @@ export function createBot(io: BotIo, cfg: BotConfig, initialMarks: Watermarks): 
   async function backfillChannel(channelId: string): Promise<void> {
     if (allow) {
       const guild = await guildOf(channelId);
-      if (guild === undefined) return hold(channelId, { event: "backfill.guild_unknown" });
+      if (guild === undefined) {
+        const status = lookupFailed.get(channelId);
+        return status !== undefined && PERMANENT.has(status) ? forbid(channelId, status) : hold(channelId, { event: "backfill.guild_unknown" });
+      }
       if (!captureGuild(guild)) return;
     }
     let cursor = marks[channelId];
@@ -194,8 +235,10 @@ export function createBot(io: BotIo, cfg: BotConfig, initialMarks: Watermarks): 
       try {
         page = await io.rest<DiscordMessage[]>(`/channels/${channelId}/messages?after=${cursor}&limit=${BACKFILL_PAGE}`);
       } catch (e) {
+        const status = statusOf(e);
+        if (status !== undefined && PERMANENT.has(status)) return forbid(channelId, status);
         // What is already queued is captured; the rest is fetched from the new watermark on release.
-        return hold(channelId, { event: "backfill.failed", error: String(e) });
+        return hold(channelId, { event: "backfill.failed", error: String(e), ...(status !== undefined ? { status } : {}) });
       }
       if (!page?.length) return;
       page.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
@@ -228,8 +271,9 @@ export function createBot(io: BotIo, cfg: BotConfig, initialMarks: Watermarks): 
     }
     for (const channelId of Object.keys(marks)) {
       if (gen !== generation) return; // a newer READY runs its own backfill
-      if (held.has(channelId)) continue; // its own timer brings it back
+      if (held.has(channelId) || forbidden.has(channelId)) continue; // its own timer brings it back; or never this run
       await backfillChannel(channelId);
+      if (!held.has(channelId)) attempts.delete(channelId);
     }
     await chain;
   }
@@ -255,7 +299,7 @@ export function createBot(io: BotIo, cfg: BotConfig, initialMarks: Watermarks): 
   async function reactionCatchUp() {
     const since = snowflakeAt(io.now() - catchupDays * 86_400_000);
     for (const channelId of Object.keys(marks)) {
-      if (held.has(channelId)) continue;
+      if (held.has(channelId) || forbidden.has(channelId)) continue;
       const owner = await guildOf(channelId);
       if (!captureGuild(owner)) continue;
       try {
