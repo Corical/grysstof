@@ -1,0 +1,26 @@
+{
+  "existing": [
+    {"key": "1563099660288004096", "status": "closed_by", "message": "m7"},
+    {"key": "1559838169497604096", "status": "owner_now", "owner": "Kelli", "message": "m5"}
+  ],
+  "new": [
+    {"channel": "servest", "client": "servest", "type": "unanswered_question", "title": "September incident report for Servest",
+     "summary": "The updated September incident report was promised for Friday and the client asked again on Monday.",
+     "owner": "Kelli", "evidence": ["m4", "m5", "m8"], "why_open": "No report in the channel since the promise."},
+    {"channel": "servest", "client": "servest", "type": "unticketed_ask", "title": "Bellville site added to the portal",
+     "summary": "A request to add the Bellville site to the portal has no follow-up in the channel.",
+     "owner": "unclear", "evidence": ["m4"], "why_open": "Nothing shows the site was added or logged."},
+    {"channel": "dev-internal", "client": null, "type": "unkept_promise", "title": "APIM routing notes for the team",
+     "summary": "A write-up of the APIM routing notes was promised for this week.",
+     "owner": "Devon", "evidence": ["m3"], "why_open": "No notes in the channel since Wednesday."},
+    {"channel": "swanzo", "client": "swanzo", "type": "unanswered_question", "title": "Reports role for Zola",
+     "summary": "Zola needs the reports role on the Swanzo portal.",
+     "owner": "unclear", "evidence": ["m1", "m10"], "why_open": "No reply in the channel since Monday 11:00."},
+    {"channel": "swanzo", "client": "swanzo", "type": "unanswered_question", "title": "Supervisor access for Zola",
+     "summary": "Zola needs supervisor access on the Swanzo portal.",
+     "owner": "Devon", "evidence": ["m1"], "why_open": "No confirmation in the channel."},
+    {"channel": "servest", "client": "servest", "type": "unanswered_question", "title": "Password reset for Thabo",
+     "summary": "A password reset was asked for (m11).",
+     "owner": "unclear", "evidence": ["m11"], "why_open": "No reply in the channel."}
+  ]
+}

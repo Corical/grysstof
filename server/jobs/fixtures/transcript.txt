@@ -1,0 +1,17 @@
+
+=== #dev-internal ===
+[m3] Wed 21 Oct 11:00 Devon: I'll write up the APIM routing notes for the team this week.
+
+=== #servest · client servest ===
+[m4] Thu 22 Oct 09:00 Thabo: Can you send the updated September incident report, and please add the new Bellville site to the portal?
+[m5] Thu 22 Oct 09:40 Kelli (reply to m4): Will do, I'll get the report out by Friday.
+[m8] Mon 26 Oct 08:15 Thabo (reply to m4): Any news on the September report?
+[m11] ⚑portal Mon 26 Oct 15:00 Thabo: Who can reset my password?
+
+=== #swanzo · client swanzo ===
+[m1] Wed 21 Oct 08:00 Lerato: Please add Zola as a supervisor on the Swanzo portal.
+[m2] Wed 21 Oct 09:00 Devon (reply to m1): Done, Zola is a supervisor now.
+[m6] Fri 23 Oct 10:00 Lerato: The 6498 export still fails on large sites.
+[m7] Fri 23 Oct 14:00 Devon (reply to m6) [reactions: 👍 by Lerato]: Found it, the fix is deployed, please retry.
+[m9] Mon 26 Oct 09:00 Lerato (reply to m7): Retried, works now, thanks!
+[m10] Mon 26 Oct 11:00 Lerato (reply to m1): Zola also needs the reports role please.

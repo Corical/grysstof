@@ -1,0 +1,171 @@
+[
+  {
+    "id": "thought-w0",
+    "content": "Discord #swanzo (Xactco), 2026-10-21, Lerato: Please add Zola as a supervisor on the Swanzo portal.",
+    "metadata": {
+      "source": "discord:268128051500417024/1300000000000000102/1562344685568004096",
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000102/1562344685568004096",
+      "channel": "swanzo",
+      "occurred_at": "2026-10-21T06:00:00.000Z",
+      "type": "observation",
+      "author_id": "700000000000000002",
+      "channel_id": "1300000000000000102"
+    },
+    "createdAt": "2026-10-21T06:00:00.000Z"
+  },
+  {
+    "id": "thought-w0b",
+    "content": "Discord #swanzo (Xactco), 2026-10-21, Devon: Done, Zola is a supervisor now.",
+    "metadata": {
+      "source": "discord:268128051500417024/1300000000000000102/1562359785062404096",
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000102/1562359785062404096",
+      "channel": "swanzo",
+      "occurred_at": "2026-10-21T07:00:00.000Z",
+      "type": "observation",
+      "author_id": "900000000000000002",
+      "channel_id": "1300000000000000102",
+      "in_reply_to": "discord:268128051500417024/1300000000000000102/1562344685568004096"
+    },
+    "createdAt": "2026-10-21T07:00:00.000Z"
+  },
+  {
+    "id": "thought-d1",
+    "content": "Discord #dev-internal (Xactco), 2026-10-21, Devon: I'll write up the APIM routing notes for the team this week.",
+    "metadata": {
+      "source": "discord:268128051500417024/1300000000000000103/1562389984051204096",
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000103/1562389984051204096",
+      "channel": "dev-internal",
+      "occurred_at": "2026-10-21T09:00:00.000Z",
+      "type": "observation",
+      "author_id": "900000000000000002",
+      "channel_id": "1300000000000000103"
+    },
+    "createdAt": "2026-10-21T09:00:00.000Z"
+  },
+  {
+    "id": "thought-s1",
+    "content": "Discord #servest (Xactco), 2026-10-22, Thabo: Can you send the updated September incident report, and please add the new Bellville site to the portal?",
+    "metadata": {
+      "source": "discord:268128051500417024/1300000000000000101/1562722172928004096",
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000101/1562722172928004096",
+      "channel": "servest",
+      "occurred_at": "2026-10-22T07:00:00.000Z",
+      "type": "observation",
+      "author_id": "700000000000000001",
+      "channel_id": "1300000000000000101"
+    },
+    "createdAt": "2026-10-22T07:00:00.000Z"
+  },
+  {
+    "id": "thought-s2",
+    "content": "Discord #servest (Xactco), 2026-10-22, Kelli: Will do, I'll get the report out by Friday.",
+    "metadata": {
+      "source": "discord:268128051500417024/1300000000000000101/1562732239257604096",
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000101/1562732239257604096",
+      "channel": "servest",
+      "occurred_at": "2026-10-22T07:40:00.000Z",
+      "type": "observation",
+      "author_id": "900000000000000001",
+      "channel_id": "1300000000000000101",
+      "in_reply_to": "discord:268128051500417024/1300000000000000101/1562722172928004096"
+    },
+    "createdAt": "2026-10-22T07:40:00.000Z"
+  },
+  {
+    "id": "thought-w1",
+    "content": "Discord #swanzo (Xactco), 2026-10-23, Lerato: The 6498 export still fails on large sites.",
+    "metadata": {
+      "source": "discord:268128051500417024/1300000000000000102/1563099660288004096",
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000102/1563099660288004096",
+      "channel": "swanzo",
+      "occurred_at": "2026-10-23T08:00:00.000Z",
+      "type": "observation",
+      "author_id": "700000000000000002",
+      "channel_id": "1300000000000000102"
+    },
+    "createdAt": "2026-10-23T08:00:00.000Z"
+  },
+  {
+    "id": "thought-w2",
+    "content": "Discord #swanzo (Xactco), 2026-10-23, Devon: Found it, the fix is deployed, please retry.",
+    "metadata": {
+      "source": "discord:268128051500417024/1300000000000000102/1563160058265604096",
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000102/1563160058265604096",
+      "channel": "swanzo",
+      "occurred_at": "2026-10-23T12:00:00.000Z",
+      "type": "observation",
+      "author_id": "900000000000000002",
+      "channel_id": "1300000000000000102",
+      "in_reply_to": "discord:268128051500417024/1300000000000000102/1563099660288004096",
+      "reactions": [
+        {
+          "emoji": "👍",
+          "count": 1,
+          "by": [
+            "Lerato"
+          ]
+        }
+      ]
+    },
+    "createdAt": "2026-10-23T12:00:00.000Z"
+  },
+  {
+    "id": "thought-s3",
+    "content": "Discord #servest (Xactco), 2026-10-26, Thabo: Any news on the September report?",
+    "metadata": {
+      "source": "discord:268128051500417024/1300000000000000101/1564160399769604096",
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000101/1564160399769604096",
+      "channel": "servest",
+      "occurred_at": "2026-10-26T06:15:00.000Z",
+      "type": "observation",
+      "author_id": "700000000000000001",
+      "channel_id": "1300000000000000101",
+      "in_reply_to": "discord:268128051500417024/1300000000000000101/1562722172928004096"
+    },
+    "createdAt": "2026-10-26T06:15:00.000Z"
+  },
+  {
+    "id": "thought-w3",
+    "content": "Discord #swanzo (Xactco), 2026-10-26, Lerato: Retried, works now, thanks!",
+    "metadata": {
+      "source": "discord:268128051500417024/1300000000000000102/1564171724390404096",
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000102/1564171724390404096",
+      "channel": "swanzo",
+      "occurred_at": "2026-10-26T07:00:00.000Z",
+      "type": "observation",
+      "author_id": "700000000000000002",
+      "channel_id": "1300000000000000102",
+      "in_reply_to": "discord:268128051500417024/1300000000000000102/1563160058265604096"
+    },
+    "createdAt": "2026-10-26T07:00:00.000Z"
+  },
+  {
+    "id": "thought-w4",
+    "content": "Discord #swanzo (Xactco), 2026-10-26, Lerato: Zola also needs the reports role please.",
+    "metadata": {
+      "source": "discord:268128051500417024/1300000000000000102/1564201923379204096",
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000102/1564201923379204096",
+      "channel": "swanzo",
+      "occurred_at": "2026-10-26T09:00:00.000Z",
+      "type": "observation",
+      "author_id": "700000000000000002",
+      "channel_id": "1300000000000000102",
+      "in_reply_to": "discord:268128051500417024/1300000000000000102/1562344685568004096"
+    },
+    "createdAt": "2026-10-26T09:00:00.000Z"
+  },
+  {
+    "id": "thought-p1",
+    "content": "Discord #servest (Xactco), 2026-10-26, Thabo: Who can reset my password?",
+    "metadata": {
+      "source": "discord:268128051500417024/1300000000000000101/1564262321356804096",
+      "proof": "https://discord.com/channels/268128051500417024/1300000000000000101/1564262321356804096",
+      "channel": "servest",
+      "occurred_at": "2026-10-26T13:00:00.000Z",
+      "type": "observation",
+      "author_id": "700000000000000001",
+      "channel_id": "1300000000000000101"
+    },
+    "createdAt": "2026-10-26T13:00:00.000Z"
+  }
+]
